@@ -1,0 +1,5 @@
+#+TITLE: Rdma Fuse
+
+* Notes
+- Filesystem stat => get inode
+- Then direct map for all nodes but root (which must be 1 on fuse)

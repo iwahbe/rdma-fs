@@ -1,25 +1,66 @@
+#![feature(duration_zero)]
+
+use clap::{App, Arg};
 use fuser::*;
 use fuser::{spawn_mount, Filesystem, KernelConfig, Request};
 use libc::{c_int, ENOSYS};
-use std::env;
+use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::stdin;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 fn main() {
-    let mountpoint = env::args_os().nth(1).unwrap();
-    let _backround = spawn_mount(NoOp, &mountpoint, &[]).unwrap();
+    let matches = App::new("Passthrough FS")
+        .version("0.1")
+        .author("Ian wahbe")
+        .arg(
+            Arg::with_name("mount at")
+                .index(1)
+                .required(true)
+                .help("The empty directory on which to mount the virtual FS"),
+        )
+        .arg(
+            Arg::with_name("mount to")
+                .index(2)
+                .required(true)
+                .help("The point on the host filesystem to mirror"),
+        )
+        .get_matches();
+    let mountpoint = matches.value_of("mount at").unwrap();
+    let mount_reflect = matches.value_of("mount to").unwrap();
+    let _backround = spawn_mount(Mount::new(mount_reflect), &mountpoint, &[]).unwrap();
     let mut s = String::new();
     println!("Return on input");
     stdin().read_line(&mut s).expect("Failed to read input");
 }
 
-struct NoOp;
+struct Mount {
+    /// Where the root of `Mount` is located in the host file system.
+    root: PathBuf,
+    root_ino: u64,
+    ino_paths: HashMap<Ino, PathBuf>,
+}
 
-impl Filesystem for NoOp {
+type Ino = u64;
+
+impl Mount {
+    fn new<T: Into<PathBuf>>(root: T) -> Self {
+        Self {
+            root: root.into(),
+            root_ino: 0,
+            ino_paths: HashMap::new(),
+        }
+    }
+}
+
+impl Filesystem for Mount {
     fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
-        println!("File system set up");
+        if !self.root.exists() || !self.root.is_dir() {
+            return Err(1);
+        }
+        println!("File system mounted to reflect {:?}", self.root);
         Ok(())
     }
 
@@ -65,29 +106,20 @@ impl Filesystem for NoOp {
     }
 
     /// Get file attributes.
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: Ino, reply: ReplyAttr) {
         println!("Trying to get file attributes of ino: {}", ino);
-        reply.attr(
-            &std::time::Duration::new(0, 0),
-            &FileAttr {
-                ino: ino,
-                size: 10,
-                blocks: 1,
-                atime: SystemTime::now(),
-                mtime: SystemTime::now(),
-                ctime: SystemTime::UNIX_EPOCH,
-                crtime: SystemTime::UNIX_EPOCH,
-                kind: FileType::RegularFile,
-                perm: 0,
-                nlink: 0,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                blksize: 0,
-                padding: 0,
-                flags: 0,
-            },
-        )
+        let handle;
+        if let Ok(k) = fs::metadata(if ino == 1 {
+            &self.root
+        } else {
+            handle = self.root.join(self.ino_paths.get(&ino).unwrap());
+            &handle
+        }) {
+            reply.attr(&std::time::Duration::ZERO, &k.into());
+        } else {
+            println!("Failed lookup on ino {:?}", ino);
+            reply.error(2);
+        };
     }
 
     /// Set file attributes.
