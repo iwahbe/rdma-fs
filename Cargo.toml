@@ -11,3 +11,5 @@ fuser = { version = "0.7", git = "https://github.com/iwahbe/fuser.git", branch =
 libc = "0.2"
 nix = "0.20"
 clap = "2.33"
+log = "0.4"
+env_logger = "0.8"

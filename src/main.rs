@@ -1,9 +1,10 @@
 #![feature(duration_zero)]
 
 use clap::{App, Arg};
+use env_logger;
 use fuser::*;
 use fuser::{spawn_mount, Filesystem, KernelConfig, Request};
-use libc::{c_int, ENOSYS};
+use libc::{c_int, statfs, ENOSYS};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -11,7 +12,12 @@ use std::io::stdin;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+const FILE_NOT_FOUND: i32 = 1;
+
 fn main() {
+    env_logger::init();
     let matches = App::new("Passthrough FS")
         .version("0.1")
         .author("Ian wahbe")
@@ -39,7 +45,7 @@ fn main() {
 struct Mount {
     /// Where the root of `Mount` is located in the host file system.
     root: PathBuf,
-    root_ino: u64,
+    root_ino: Ino,
     ino_paths: HashMap<Ino, PathBuf>,
 }
 
@@ -49,8 +55,16 @@ impl Mount {
     fn new<T: Into<PathBuf>>(root: T) -> Self {
         Self {
             root: root.into(),
-            root_ino: 0,
             ino_paths: HashMap::new(),
+            root_ino: 0,
+        }
+    }
+
+    fn at_ino(&self, ino: &Ino) -> Option<&PathBuf> {
+        if *ino == 1 || *ino == self.root_ino {
+            Some(&self.root)
+        } else {
+            self.ino_paths.get(ino)
         }
     }
 }
@@ -60,12 +74,15 @@ impl Filesystem for Mount {
         if !self.root.exists() || !self.root.is_dir() {
             return Err(1);
         }
-        println!("File system mounted to reflect {:?}", self.root);
+        self.root = self.root.canonicalize().unwrap();
+        let root_data = fs::metadata(&self.root).unwrap();
+        self.root_ino = root_data.ino();
+        log::info!("File system mounted to reflect {:?}", self.root);
         Ok(())
     }
 
     fn destroy(&mut self, _req: &Request<'_>) {
-        println!("File system destroyed")
+        log::info!("File system destroyed")
     }
 
     /// Open a file.
@@ -77,14 +94,37 @@ impl Filesystem for Mount {
     /// filesystem may set, to change the way the file is opened. See fuse_file_info
     /// structure in <fuse_common.h> for more details.
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        println!("Opened file ino: {}", ino);
+        log::info!("Opened file ino: {}", ino);
         reply.opened(0, 0);
     }
 
     /// Look up a directory entry by name and get its attributes.
-    fn lookup(&mut self, _req: &Request<'_>, _parent: u64, name: &OsStr, reply: ReplyEntry) {
-        println!("Attempted dir lookup to {:?}", name);
-        reply.error(ENOSYS);
+    fn lookup(&mut self, _req: &Request<'_>, parent: Ino, name: &OsStr, reply: ReplyEntry) {
+        let parent = if let Some(k) = self.at_ino(&parent) {
+            k
+        } else {
+            reply.error(FILE_NOT_FOUND);
+            log::debug!(
+                "Attempted lookup of parrent ino {:?}. File not found.",
+                parent
+            );
+            return;
+        };
+        let new_file = parent.join(name);
+        let data = if let Ok(k) = fs::metadata(&new_file) {
+            k
+        } else {
+            reply.error(1);
+            return;
+        };
+
+        log::info!(
+            "Performed lookup on {:?} with parrent {:?}. Found new Ino {:?}",
+            name,
+            parent,
+            new_file
+        );
+        reply.entry(&std::time::Duration::ZERO, &data.into(), 0);
     }
 
     /// Forget about an inode.
@@ -94,7 +134,13 @@ impl Filesystem for Mount {
     /// each forget. The filesystem may ignore forget calls, if the inodes don't need to
     /// have a limited lifetime. On unmount it is not guaranteed, that all referenced
     /// inodes will receive a forget message.
-    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
+    fn forget(&mut self, _req: &Request<'_>, ino: Ino, _nlookup: u64) {
+        if let Some(buf) = self.at_ino(&ino) {
+            log::info!("Attempted to forget file {:?}", buf);
+        } else {
+            log::error!("Attempted to forget file with invalid ino: {:?}", ino);
+        }
+    }
 
     /// Like forget, but take multiple forget requests at once for performance. The default
     /// implementation will fallback to forget.
@@ -107,17 +153,18 @@ impl Filesystem for Mount {
 
     /// Get file attributes.
     fn getattr(&mut self, _req: &Request<'_>, ino: Ino, reply: ReplyAttr) {
-        println!("Trying to get file attributes of ino: {}", ino);
         let handle;
-        if let Ok(k) = fs::metadata(if ino == 1 {
+        let buf = if ino == 1 {
             &self.root
         } else {
-            handle = self.root.join(self.ino_paths.get(&ino).unwrap());
+            handle = self.root.join(self.at_ino(&ino).unwrap());
             &handle
-        }) {
+        };
+        if let Ok(k) = fs::metadata(buf) {
             reply.attr(&std::time::Duration::ZERO, &k.into());
+            log::info!("Replied with metadata of file {:?}", buf);
         } else {
-            println!("Failed lookup on ino {:?}", ino);
+            log::error!("Failed lookup on ino {:?}", ino);
             reply.error(2);
         };
     }
@@ -246,7 +293,7 @@ impl Filesystem for Mount {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        println!("Attempting to read from file: {}", fh);
+        log::error!("Attempting to read from file: {}", fh);
         reply.error(ENOSYS);
     }
 
@@ -290,11 +337,12 @@ impl Filesystem for Mount {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        log::error!("Attempting to flush ino {:?}", ino);
         reply.error(ENOSYS);
     }
 
@@ -341,7 +389,7 @@ impl Filesystem for Mount {
     /// directory stream operations in case the contents of the directory can change
     /// between opendir and releasedir.
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        println!("Attempting to open a directory ino: {}", ino);
+        log::error!("Attempting to open a directory ino: {}", ino);
         reply.opened(0, 0);
     }
 
@@ -358,7 +406,7 @@ impl Filesystem for Mount {
         _offset: i64,
         reply: ReplyDirectory,
     ) {
-        println!("Attempting to read directory ino: ino {}", ino);
+        log::error!("Attempting to read directory ino: ino {}", ino);
         reply.error(ENOSYS);
     }
 
@@ -409,9 +457,37 @@ impl Filesystem for Mount {
     }
 
     /// Get file system statistics.
-    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
-        println!("Attempted to get stats on fs(ino): {}", ino);
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+    fn statfs(&mut self, _req: &Request<'_>, ino: Ino, reply: ReplyStatfs) {
+        let mut buf: statfs = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        let path = if let Some(k) = self.at_ino(&ino) {
+            k.as_os_str()
+        } else {
+            log::error!("statfs: Attempted to access invalid ino {:?}", ino);
+            reply.error(1);
+            return;
+        };
+        log::info!("Replying with file system stats called on file {:?}", path);
+        let e = unsafe { statfs(path.as_bytes().as_ptr() as _, &mut buf as _) };
+        if e != 0 {
+            log::error!(
+                "Error attempting to get file system statistics on path {:?}, ino: {:?}",
+                path,
+                ino
+            );
+            reply.error(1);
+            return;
+        }
+        reply.statfs(
+            buf.f_blocks,
+            buf.f_bfree,
+            buf.f_bavail,
+            buf.f_files,
+            buf.f_ffree,
+            buf.f_bsize,
+            255,
+            buf.f_bsize, // Hardly ever used:
+                         // https://stackoverflow.com/questions/54823541/what-do-f-bsize-and-f-frsize-in-struct-statvfs-stand-for
+        );
     }
 
     /// Set an extended attribute.
@@ -461,7 +537,18 @@ impl Filesystem for Mount {
     /// mount option is given, this method is not called. This method is not called
     /// under Linux kernel versions 2.4.x
     fn access(&mut self, _req: &Request<'_>, ino: u64, _mask: i32, reply: ReplyEmpty) {
-        println!("Attempted to get permissions on file ino: {}", ino);
+        let buf = if let Some(k) = self.at_ino(&ino) {
+            log::info!("Attempted permissions access of file {:?}", k);
+            k
+        } else {
+            log::debug!("Failed to get permissions: invalid ino: {:?}", ino);
+            reply.error(1);
+            return;
+        };
+        log::error!(
+            "Attempted to get permissions on file {:?}: not yet implemented",
+            buf
+        );
         reply.error(ENOSYS);
     }
 
