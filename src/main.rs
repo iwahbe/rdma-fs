@@ -93,9 +93,20 @@ impl Filesystem for Mount {
     /// anything in fh. There are also some flags (direct_io, keep_cache) which the
     /// filesystem may set, to change the way the file is opened. See fuse_file_info
     /// structure in <fuse_common.h> for more details.
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        log::error!("Open called on ino {:?}", ino);
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &Request<'_>, ino: Ino, flags: i32, reply: ReplyOpen) {
+        if let Some(path) = self.at_ino(&ino) {
+            log::debug!("Open called on ino {:?} = {:?}", ino, path);
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let res = unsafe { libc::open(path.as_ptr(), flags) };
+            if res >= 0 {
+                reply.opened(res as u64, flags as u32);
+            } else {
+                reply.error(res);
+            }
+        } else {
+            log::error!("Open failed with invalid ino {:?}", ino);
+            reply.error(FILE_NOT_FOUND);
+        }
     }
 
     /// Look up a directory entry by name and get its attributes.
@@ -264,13 +275,18 @@ impl Filesystem for Mount {
         _ino: u64,
         fh: u64,
         _offset: i64,
-        _size: u32,
+        size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        log::error!("Attempting to read from file: {}", fh);
-        reply.error(ENOSYS);
+        let mut buf = vec![0; size as usize];
+        let bytes_read = unsafe { libc::read(fh as _, buf.as_mut_ptr() as _, size as usize) };
+        if bytes_read != -1 {
+            reply.data(&buf);
+        } else {
+            reply.error(bytes_read as i32);
+        }
     }
 
     /// Write data.
@@ -314,11 +330,12 @@ impl Filesystem for Mount {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        log::error!("Attempting to flush ino {:?}", ino);
+        log::error!("Attempting to flush ino {:?}. Not yet implimented", ino);
+
         reply.error(ENOSYS);
     }
 
