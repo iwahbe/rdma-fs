@@ -14,7 +14,7 @@ use std::{fs, io::stdin};
 
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
-const FILE_NOT_FOUND: i32 = 1;
+use nix::errno::{errno, Errno};
 
 fn main() {
     env_logger::init();
@@ -95,17 +95,17 @@ impl Filesystem for Mount {
     /// structure in <fuse_common.h> for more details.
     fn open(&mut self, _req: &Request<'_>, ino: Ino, flags: i32, reply: ReplyOpen) {
         if let Some(path) = self.at_ino(&ino) {
-            log::debug!("Open called on ino {:?} = {:?}", ino, path);
+            log::trace!("Open called on ino {:?} = {:?}", ino, path);
             let path = CString::new(path.as_os_str().as_bytes()).unwrap();
             let res = unsafe { libc::open(path.as_ptr(), flags) };
             if res >= 0 {
                 reply.opened(res as u64, flags as u32);
             } else {
-                reply.error(res);
+                reply.error(errno());
             }
         } else {
             log::error!("Open failed with invalid ino {:?}", ino);
-            reply.error(FILE_NOT_FOUND);
+            reply.error(libc::EIO);
         }
     }
 
@@ -114,7 +114,7 @@ impl Filesystem for Mount {
         let parent = if let Some(k) = self.at_ino(&parent) {
             k
         } else {
-            reply.error(FILE_NOT_FOUND);
+            reply.error(libc::ENOENT);
             log::error!(
                 "Attempted lookup of parrent ino {:?}. File not found.",
                 parent
@@ -125,11 +125,11 @@ impl Filesystem for Mount {
         let data = if let Ok(k) = fs::metadata(&new_file) {
             k
         } else {
-            reply.error(1);
+            reply.error(libc::ENOENT);
             return;
         };
         reply.entry(&std::time::Duration::ZERO, &(&data).into(), 0);
-        log::info!(
+        log::trace!(
             "Performed lookup on {:?} with parrent {:?}. Found new Ino {:?}",
             name,
             parent,
@@ -149,10 +149,10 @@ impl Filesystem for Mount {
         };
         if let Ok(k) = fs::metadata(buf) {
             reply.attr(&std::time::Duration::ZERO, &(&k).into());
-            log::info!("Replied with metadata of file {:?}", buf);
+            log::trace!("Replied with metadata of file {:?}", buf);
         } else {
             log::error!("Failed lookup on ino {:?} = {:?}", ino, buf);
-            reply.error(2);
+            reply.error(libc::ENOENT);
         };
     }
 
@@ -175,11 +175,13 @@ impl Filesystem for Mount {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        log::error!("setattr failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
     /// Read symbolic link.
     fn readlink(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyData) {
+        log::error!("readlink failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -189,12 +191,13 @@ impl Filesystem for Mount {
         &mut self,
         _req: &Request<'_>,
         _parent: u64,
-        _name: &OsStr,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        log::error!("mknod not yet implemented for {:?}", name);
         reply.error(ENOSYS);
     }
 
@@ -203,21 +206,24 @@ impl Filesystem for Mount {
         &mut self,
         _req: &Request<'_>,
         _parent: u64,
-        _name: &OsStr,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        log::error!("mkdir not yet implemented fro {:?}", name);
         reply.error(ENOSYS);
     }
 
     /// Remove a file.
-    fn unlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, _req: &Request<'_>, _parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        log::error!("Unlink failed on file {:?}", name);
         reply.error(ENOSYS);
     }
 
     /// Remove a directory.
     fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
+        log::error!("rmdir failed: not yet implementd");
         reply.error(ENOSYS);
     }
 
@@ -230,6 +236,7 @@ impl Filesystem for Mount {
         _link: &Path,
         reply: ReplyEntry,
     ) {
+        log::error!("symlink failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -240,10 +247,11 @@ impl Filesystem for Mount {
         _parent: u64,
         _name: &OsStr,
         _newparent: u64,
-        _newname: &OsStr,
+        newname: &OsStr,
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        log::error!("Renaming file to {:?}, not yet implemented", newname);
         reply.error(ENOSYS);
     }
 
@@ -253,9 +261,13 @@ impl Filesystem for Mount {
         _req: &Request<'_>,
         _ino: u64,
         _newparent: u64,
-        _newname: &OsStr,
+        newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        log::error!(
+            "Creating link to newname {:?}, not yet implemented",
+            newname
+        );
         reply.error(ENOSYS);
     }
 
@@ -280,12 +292,13 @@ impl Filesystem for Mount {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        log::trace!("Writing to fh {:?}", fh);
         let mut buf = vec![0; size as usize];
         let bytes_read = unsafe { libc::read(fh as _, buf.as_mut_ptr() as _, size as usize) };
         if bytes_read != -1 {
             reply.data(&buf);
         } else {
-            reply.error(bytes_read as i32);
+            reply.error(errno());
         }
     }
 
@@ -305,15 +318,23 @@ impl Filesystem for Mount {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
+        fh: u64,
         _offset: i64,
-        _data: &[u8],
+        data: &[u8],
         _write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        reply.error(ENOSYS);
+        log::info!("Attempting to write to file at handle: {:?}", fh);
+        let bytes_written = unsafe { libc::write(fh as _, data.as_ptr() as _, data.len()) };
+        if bytes_written != -1 {
+            log::trace!("wrote {:?} bytes to fh {:?}", bytes_written, fh);
+            reply.written(bytes_written as _);
+        } else {
+            log::error!("Failed to write bytes to fh {:?}", fh);
+            reply.error(errno());
+        }
     }
 
     /// Flush method.
@@ -329,14 +350,22 @@ impl Filesystem for Mount {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        log::error!("Attempting to flush ino {:?}. Not yet implimented", ino);
-
-        reply.error(ENOSYS);
+        let res = unsafe { libc::close(fh as _) };
+        if res != 0 {
+            log::error!(
+                "flush: close syscall failed on fh {:?} with errorno: {:?}.",
+                fh,
+                res
+            );
+            reply.error(errno());
+        } else {
+            reply.ok();
+        }
     }
 
     /// Release an open file.
@@ -371,6 +400,7 @@ impl Filesystem for Mount {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        log::error!("fsync called but not yet implmeneted");
         reply.error(ENOSYS);
     }
 
@@ -391,7 +421,7 @@ impl Filesystem for Mount {
         let res = unsafe { libc::opendir(buf.as_ptr() as _) };
         if res.is_null() {
             log::error!("opendir: libc call failed with ERRNO=?");
-            reply.error(1);
+            reply.error(errno());
         } else {
             reply.opened(res as u64, flags as u32);
         }
@@ -411,9 +441,25 @@ impl Filesystem for Mount {
         mut reply: ReplyDirectory,
     ) {
         loop {
+            Errno::clear(); // Because it's not clear if readdir failed from it's output
             let dir_ent = unsafe { libc::readdir(fh as _) };
             if dir_ent.is_null() {
-                break;
+                use libc::*;
+                match errno() {
+                    EACCES | EBADF | EMFILE | ENFILE | ENOENT | ENOMEM | ENOTDIR => {
+                        reply.error(errno());
+                        log::error!(
+                            "Encountered error {} reading directory {:?}, fh {:?}",
+                            std::io::Error::from_raw_os_error(errno()),
+                            self.at_ino(&ino)
+                                .map(|b| b.as_os_str())
+                                .unwrap_or(OsStr::new("Unknown")),
+                            fh
+                        );
+                        return;
+                    }
+                    _ => break,
+                }
             }
             let dir_ent = unsafe { *dir_ent };
             let file_len = unsafe { CStr::from_ptr(dir_ent.d_name.as_ptr() as _) }
@@ -421,7 +467,10 @@ impl Filesystem for Mount {
                 .len();
             let file =
                 OsStr::from_bytes(unsafe { std::mem::transmute(&dir_ent.d_name[..file_len]) });
-            log::info!("File {:?} under dir {:?}", file, ino);
+            log::trace!("File {:?} under dir {:?}", file, ino);
+            if dir_ent.d_ino == 0 {
+                continue; // file has been deleted, but has not yet been removed
+            }
             let full = reply.add(
                 dir_ent.d_ino,
                 dir_ent
@@ -439,9 +488,8 @@ impl Filesystem for Mount {
                 break;
             }
         }
-        // TODO: check for error
         reply.ok();
-        log::info!("Read directory at ino: {}", ino);
+        log::trace!("Read directory at ino: {}", ino);
     }
 
     /// Read directory.
@@ -477,7 +525,7 @@ impl Filesystem for Mount {
         if res == 0 {
             reply.ok();
         } else {
-            reply.error(res);
+            reply.error(errno());
         }
     }
 
@@ -503,10 +551,10 @@ impl Filesystem for Mount {
             k.as_os_str()
         } else {
             log::error!("statfs: Attempted to access invalid ino {:?}", ino);
-            reply.error(1);
+            reply.error(errno());
             return;
         };
-        log::info!("Replying with file system stats called on file {:?}", path);
+        log::trace!("Replying with file system stats called on file {:?}", path);
         let cstr = CString::new(path.as_bytes()).unwrap();
         let e = unsafe { statfs(cstr.as_ptr(), &mut buf as _) };
         if e != 0 {
@@ -516,7 +564,7 @@ impl Filesystem for Mount {
                 path,
                 ino
             );
-            reply.error(1);
+            reply.error(errno());
             return;
         }
         reply.statfs(
@@ -543,6 +591,7 @@ impl Filesystem for Mount {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        log::error!("setxattr failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -558,6 +607,7 @@ impl Filesystem for Mount {
         _size: u32,
         reply: ReplyXattr,
     ) {
+        log::error!("getxattr failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -566,11 +616,13 @@ impl Filesystem for Mount {
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
     fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: ReplyXattr) {
+        log::error!("listxattr failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
     /// Remove an extended attribute.
     fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+        log::error!("removexattr failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -578,19 +630,17 @@ impl Filesystem for Mount {
     /// This will be called for the access() system call. If the 'default_permissions'
     /// mount option is given, this method is not called. This method is not called
     /// under Linux kernel versions 2.4.x
-    fn access(&mut self, _req: &Request<'_>, ino: u64, _mask: i32, reply: ReplyEmpty) {
-        let _buf = if let Some(k) = self.at_ino(&ino) {
-            log::info!("Attempted permissions access of file {:?}", k);
-            k
+    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        if let Some(k) = self.at_ino(&ino) {
+            log::trace!("Attempted permissions access of file {:?}", k);
+            match unsafe { libc::access(k.as_os_str().as_bytes().as_ptr() as _, mask) } {
+                0 => reply.ok(),
+                _ => reply.error(errno()),
+            };
         } else {
-            //40847785
             log::error!("Failed to get permissions: invalid ino: {:?}", ino);
-            reply.error(1);
-            return;
+            reply.error(ENOSYS);
         };
-        reply.ok(); // TODO: check the permissions correctly. We currently
-                    // assume that the user is allowed to access anything that
-                    // the fs can see.
     }
 
     /// Create and open a file.
@@ -606,14 +656,34 @@ impl Filesystem for Mount {
     fn create(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
+        parent: Ino,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        reply.error(ENOSYS);
+        log::info!("create called on file");
+        if let Some(parent) = self.at_ino(&parent) {
+            let path = parent.join(name);
+            let c_str = CString::new(path.as_os_str().as_bytes())
+                .expect("Path does not have a null terminator");
+            let fd = unsafe { libc::open(c_str.as_ptr(), flags | libc::O_CREAT | libc::O_TRUNC) };
+            if fd >= 0 {
+                let attr = fs::metadata(&path).unwrap();
+                self.ino_paths.insert(attr.ino(), path);
+                reply.created(
+                    &std::time::Duration::ZERO,
+                    &(&attr).into(),
+                    0,
+                    fd as _,
+                    flags as _,
+                );
+            } else {
+                log::error!("Failed to create file {:?} with errno {:?}", name, errno());
+                reply.error(errno());
+            }
+        }
     }
 
     /// Test for a POSIX file lock.
@@ -653,6 +723,7 @@ impl Filesystem for Mount {
         _sleep: bool,
         reply: ReplyEmpty,
     ) {
+        log::error!("setlk failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -667,6 +738,7 @@ impl Filesystem for Mount {
         _idx: u64,
         reply: ReplyBmap,
     ) {
+        log::error!("bmap failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -682,6 +754,7 @@ impl Filesystem for Mount {
         _out_size: u32,
         reply: ReplyIoctl,
     ) {
+        log::error!("ioctl failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -696,6 +769,7 @@ impl Filesystem for Mount {
         _mode: i32,
         reply: ReplyEmpty,
     ) {
+        log::error!("falocate failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -704,12 +778,18 @@ impl Filesystem for Mount {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _whence: i32,
+        fh: u64,
+        offset: i64,
+        whence: i32,
         reply: ReplyLseek,
     ) {
-        reply.error(ENOSYS);
+        let offset = unsafe { libc::lseek(fh as _, offset, whence) };
+        if offset == -1 {
+            log::error!("lseek failed with error");
+            reply.error(errno());
+        } else {
+            reply.offset(offset);
+        }
     }
 
     /// Copy the specified range from the source inode to the destination inode
@@ -726,6 +806,7 @@ impl Filesystem for Mount {
         _flags: u32,
         reply: ReplyWrite,
     ) {
+        log::error!("copy_file_range failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -733,6 +814,7 @@ impl Filesystem for Mount {
     /// FUSE_VOL_RENAME to enable
     #[cfg(target_os = "macos")]
     fn setvolname(&mut self, _req: &Request<'_>, _name: &OsStr, reply: ReplyEmpty) {
+        log::error!("setvolname failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -748,6 +830,7 @@ impl Filesystem for Mount {
         _options: u64,
         reply: ReplyEmpty,
     ) {
+        log::error!("exchange failed: not yet implemented");
         reply.error(ENOSYS);
     }
 
@@ -755,6 +838,7 @@ impl Filesystem for Mount {
     /// during init to FUSE_XTIMES to enable
     #[cfg(target_os = "macos")]
     fn getxtimes(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyXTimes) {
+        log::error!("getxtimes failed: not yet implemented");
         reply.error(ENOSYS);
     }
 }
