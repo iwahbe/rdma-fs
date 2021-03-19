@@ -1,3 +1,4 @@
+#![feature(try_blocks)]
 #![feature(duration_zero)]
 
 use clap::{App, Arg};
@@ -160,29 +161,71 @@ impl Filesystem for Mount {
     fn setattr(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
         _fh: Option<u64>,
-        _crtime: Option<SystemTime>,
+        crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        log::error!("setattr failed: not yet implemented");
-        reply.error(ENOSYS);
+        let res = try {
+            let path = self.at_ino(&ino).ok_or(libc::ENOENT)?;
+            let mut attr: FileAttr = fs::metadata(path).as_ref().unwrap().try_into().unwrap();
+            macro_rules! maybe_set_attr {
+                ($name: tt) => {
+                    if let Some($name) = $name {
+                        attr.$name = $name
+                    }
+                };
+                ($name: tt, "time") => {
+                    if let Some($name) = $name {
+                        attr.$name = match $name {
+                            TimeOrNow::Now => SystemTime::now(),
+                            TimeOrNow::SpecificTime(t) => t,
+                        }
+                    }
+                };
+            }
+            maybe_set_attr!(uid);
+            maybe_set_attr!(gid);
+            maybe_set_attr!(size);
+            maybe_set_attr!(atime, "time");
+            maybe_set_attr!(mtime, "time");
+            maybe_set_attr!(ctime);
+            maybe_set_attr!(crtime);
+            maybe_set_attr!(flags);
+            attr
+        };
+        match res {
+            Ok(k) => reply.attr(&std::time::Duration::ZERO, &k),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Read symbolic link.
-    fn readlink(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyData) {
-        log::error!("readlink failed: not yet implemented");
-        reply.error(ENOSYS);
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let res = try {
+            let path = self.at_ino(&ino).ok_or(libc::ENOENT)?;
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            static BUF: &[u8] = &[0; libc::PATH_MAX as usize];
+            let res = unsafe { libc::readlink(path.as_ptr(), BUF.as_ptr() as _, BUF.len()) };
+            match res {
+                size @ _ if size >= 0 => &BUF[..size as usize],
+                _ => Err(errno())?,
+            }
+        };
+        match res {
+            Ok(k) => reply.data(k),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Create file node.
@@ -205,70 +248,150 @@ impl Filesystem for Mount {
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
+        parent: Ino,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
-        log::error!("mkdir not yet implemented fro {:?}", name);
-        reply.error(ENOSYS);
+        let res = try {
+            let name = self.at_ino(&parent).ok_or(libc::ENOENT)?.join(name);
+            let c_name = CString::new(name.as_os_str().as_bytes()).unwrap();
+            // NOTE: unsure about the bit-and
+            let res = unsafe { libc::mkdir(c_name.as_ptr(), mode as u16 & umask as u16) };
+            match res {
+                0 => fs::metadata(&name).as_ref().unwrap().try_into().unwrap(),
+                _ => Err(errno())?,
+            }
+        };
+        match res {
+            Ok(k) => reply.entry(&std::time::Duration::ZERO, &k, 0),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Remove a file.
-    fn unlink(&mut self, _req: &Request<'_>, _parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        log::error!("Unlink failed on file {:?}", name);
-        reply.error(ENOSYS);
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(parent) = self.at_ino(&parent) {
+            let fname = CString::new(parent.join(name).as_os_str().as_bytes()).unwrap();
+            let res = unsafe { libc::unlink(fname.as_ptr()) };
+            if res == 0 {
+                reply.ok()
+            } else {
+                reply.error(errno())
+            }
+        } else {
+            log::error!("Unlink failed on invalid parent ino {:?}", parent);
+            reply.error(libc::ENOENT);
+        }
     }
 
     /// Remove a directory.
-    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        log::error!("rmdir failed: not yet implementd");
-        reply.error(ENOSYS);
+    fn rmdir(&mut self, _req: &Request<'_>, parent: Ino, name: &OsStr, reply: ReplyEmpty) {
+        let res = try {
+            let path = self.at_ino(&parent).ok_or(libc::ENOENT)?.join(name);
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let res = unsafe { libc::rmdir(path.as_ptr()) };
+            match res {
+                0 => (),
+                _ => Err(errno())?,
+            }
+        };
+        match res {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Create a symbolic link.
     fn symlink(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _link: &Path,
+        parent: u64,
+        name: &OsStr,
+        link: &Path,
         reply: ReplyEntry,
     ) {
-        log::error!("symlink failed: not yet implemented");
-        reply.error(ENOSYS);
+        let res = try {
+            let path = self.at_ino(&parent).ok_or(libc::ENOENT)?.join(name);
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let c_link = CString::new(link.as_os_str().as_bytes()).unwrap();
+            let res = unsafe { libc::symlink(path.as_ptr(), c_link.as_ptr()) };
+            match res {
+                0 => fs::metadata(link).as_ref().unwrap().into(),
+                _ => Err(errno())?,
+            }
+        };
+        match res {
+            Ok(k) => reply.entry(&std::time::Duration::ZERO, &k, 0),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Rename a file.
     fn rename(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _newparent: u64,
+        parent: Ino,
+        name: &OsStr,
+        newparent: Ino,
         newname: &OsStr,
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        log::error!("Renaming file to {:?}, not yet implemented", newname);
-        reply.error(ENOSYS);
+        let res = try {
+            let old_name = CString::new(name.as_bytes()).unwrap();
+            let newname = CString::new(newname.as_bytes()).unwrap();
+            let res = unsafe {
+                libc::renameat(
+                    parent as _,
+                    old_name.as_ptr(),
+                    newparent as _,
+                    newname.as_ptr(),
+                )
+            };
+            match res {
+                0 => (),
+                _ => Err(errno())?,
+            }
+        };
+        match res {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Create a hard link.
     fn link(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _newparent: u64,
+        ino: Ino,
+        newparent: Ino,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        log::error!(
-            "Creating link to newname {:?}, not yet implemented",
-            newname
-        );
-        reply.error(ENOSYS);
+        let res = try {
+            let old_name = CString::new(
+                self.at_ino(&ino)
+                    .ok_or(libc::ENOENT)?
+                    .as_os_str()
+                    .as_bytes(),
+            )
+            .unwrap();
+            let newparent = self.at_ino(&newparent).ok_or(libc::ENOENT)?;
+            let path = newparent.join(newname);
+            let path = path.as_os_str();
+            let newname = CString::new(path.as_bytes()).unwrap();
+            let res = unsafe { libc::link(old_name.as_ptr(), newname.as_ptr()) };
+            match res {
+                0 => fs::metadata(path).as_ref().unwrap().try_into().unwrap(),
+                _ => Err(errno())?,
+            }
+        };
+        match res {
+            Ok(k) => reply.entry(&std::time::Duration::ZERO, &k, 0),
+            Err(e) => reply.error(e),
+        }
     }
 
     /// Read data.
