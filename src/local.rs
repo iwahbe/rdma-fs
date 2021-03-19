@@ -233,7 +233,7 @@ impl Filesystem for LocalMount {
             let name = self.at_ino(&parent).ok_or(libc::ENOENT)?.join(name);
             let c_name = CString::new(name.as_os_str().as_bytes()).unwrap();
             // NOTE: unsure about the bit-and
-            let res = unsafe { libc::mkdir(c_name.as_ptr(), mode as u16 & umask as u16) };
+            let res = unsafe { libc::mkdir(c_name.as_ptr(), (mode & umask) as _) };
             match res {
                 0 => fs::metadata(&name).as_ref().unwrap().try_into().unwrap(),
                 _ => Err(errno())?,
@@ -566,15 +566,20 @@ impl Filesystem for LocalMount {
             let file =
                 OsStr::from_bytes(unsafe { std::mem::transmute(&dir_ent.d_name[..file_len]) });
             log::trace!("File {:?} under dir {:?}", file, ino);
+
             if dir_ent.d_ino == 0 {
                 continue; // file has been deleted, but has not yet been removed
             }
+
+            // The seek data has different names on different OSs
+            #[cfg(target_os = "macos")]
+            let seek = dir_ent.d_seekoff;
+            #[cfg(not(target_os = "macos"))]
+            let seek = dir_ent.f_off;
+
             let full = reply.add(
                 dir_ent.d_ino,
-                dir_ent
-                    .d_seekoff
-                    .try_into()
-                    .expect("File length does not fit into i64"),
+                seek.try_into().expect("File length does not fit into i64"),
                 dir_ent.d_type.try_into().expect("Unknown file type"),
                 file,
             );
@@ -666,15 +671,15 @@ impl Filesystem for LocalMount {
             return;
         }
         reply.statfs(
-            buf.f_blocks,
-            buf.f_bfree,
-            buf.f_bavail,
-            buf.f_files,
-            buf.f_ffree,
-            buf.f_bsize,
+            buf.f_blocks as _,
+            buf.f_bfree as _,
+            buf.f_bavail as _,
+            buf.f_files as _,
+            buf.f_ffree as _,
+            buf.f_bsize as _,
             255,
-            buf.f_bsize, // Hardly ever used:
-                         // https://stackoverflow.com/questions/54823541/what-do-f-bsize-and-f-frsize-in-struct-statvfs-stand-for
+            buf.f_bsize as _, // Hardly ever used:
+                              // https://stackoverflow.com/questions/54823541/what-do-f-bsize-and-f-frsize-in-struct-statvfs-stand-for
         );
     }
 
