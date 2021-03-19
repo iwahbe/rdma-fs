@@ -162,17 +162,17 @@ impl Filesystem for Mount {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
@@ -193,14 +193,21 @@ impl Filesystem for Mount {
                         }
                     }
                 };
+                ($name: tt, "ignore") => {
+                    let _ = $name;
+                };
             }
+            maybe_set_attr!(mode, "ignore");
             maybe_set_attr!(uid);
             maybe_set_attr!(gid);
             maybe_set_attr!(size);
             maybe_set_attr!(atime, "time");
             maybe_set_attr!(mtime, "time");
             maybe_set_attr!(ctime);
+            maybe_set_attr!(fh, "ignore");
             maybe_set_attr!(crtime);
+            maybe_set_attr!(chgtime, "ignore");
+            maybe_set_attr!(bkuptime, "ignore");
             maybe_set_attr!(flags);
             attr
         };
