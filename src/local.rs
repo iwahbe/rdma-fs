@@ -575,7 +575,7 @@ impl Filesystem for LocalMount {
             #[cfg(target_os = "macos")]
             let seek = dir_ent.d_seekoff;
             #[cfg(not(target_os = "macos"))]
-            let seek = dir_ent.f_off;
+            let seek = dir_ent.d_off;
 
             let full = reply.add(
                 dir_ent.d_ino,
