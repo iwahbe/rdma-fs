@@ -16,9 +16,179 @@ pub struct LocalMount {
     root: PathBuf,
     root_ino: Ino,
     ino_paths: HashMap<Ino, PathBuf>,
+    open_files: HashMap<Fh, OpenFile>,
+}
+
+use file::{FileBuilder, OpenFile};
+mod file {
+    use super::Fh;
+    use memmap;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::FromRawFd;
+    use std::path::Path;
+    use std::{fs, io};
+
+    pub struct OpenFile {
+        memory: Option<memmap::MmapMut>,
+        file: fs::File,
+        len: u64,
+        fh: Fh,
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct FileBuilder {
+        create: bool,
+        read: bool,
+        write: bool,
+        trunc: bool,
+        raw_flags: i32,
+    }
+
+    impl FileBuilder {
+        pub fn new() -> Self {
+            Self {
+                create: false,
+                read: false,
+                write: false,
+                trunc: false,
+                raw_flags: 0,
+            }
+        }
+
+        pub fn create(mut self, create: bool) -> Self {
+            self.create = create;
+            self
+        }
+
+        pub fn read(mut self, read: bool) -> Self {
+            self.read = read;
+            self
+        }
+
+        pub fn write(mut self, write: bool) -> Self {
+            self.write = write;
+            self
+        }
+
+        pub fn trunc(mut self, trunc: bool) -> Self {
+            self.trunc = trunc;
+            self
+        }
+
+        pub fn flags(mut self, flags: i32) -> Self {
+            self.raw_flags |= flags;
+            self
+        }
+
+        /// Creates a new openfile from unix flags
+        pub fn path(self, path: &Path) -> io::Result<OpenFile> {
+            use libc::*;
+            let mut raw_flags = self.raw_flags;
+            if self.read && self.write {
+                raw_flags |= O_RDWR
+            } else if self.read {
+                raw_flags |= O_RDONLY
+            } else if self.write {
+                raw_flags |= O_WRONLY
+            }
+            if self.create {
+                raw_flags |= O_CREAT
+            }
+            if self.trunc {
+                raw_flags |= O_TRUNC
+            }
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+
+            let res = unsafe { creat(path.as_ptr(), raw_flags as _) };
+            if res < 0 {
+                panic!("Bad create!!!")
+            }
+            let file = unsafe { fs::File::from_raw_fd(res) };
+
+            let meta = file.metadata()?;
+            let fh = meta.ino() as _;
+            Ok(OpenFile {
+                memory: None,
+                len: meta.len(),
+                file,
+                fh,
+            })
+        }
+    }
+
+    impl OpenFile {
+        pub fn metadata(&self) -> io::Result<fs::Metadata> {
+            self.file.metadata()
+        }
+
+        /// Truncate the file to size. size can be larger or smaller then the
+        /// previous file size.
+        pub fn truncate(&mut self, size: u64) -> io::Result<()> {
+            self.memory.take();
+            self.file.set_len(size)?;
+            let meta = self.file.metadata()?;
+            self.len = meta.len();
+            Ok(())
+        }
+
+        // Expose a unique file handle
+        pub fn fh(&self) -> Fh {
+            self.fh
+        }
+
+        /// Get a reference to the backing memory.
+        fn get_map(&mut self) -> io::Result<&mut memmap::MmapMut> {
+            if self.memory.is_none() {
+                self.memory = Some(unsafe { memmap::MmapOptions::new().map_mut(&self.file)? });
+            }
+            Ok(unsafe { self.memory.as_mut().unwrap_unchecked() })
+        }
+
+        pub fn write(&mut self, buf: &[u8], offset: i64) -> io::Result<usize> {
+            if buf.len() as u64 + offset as u64 > self.len {
+                self.truncate(buf.len() as u64 + offset as u64)?;
+            }
+            let map = self.get_map()?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    map.as_mut_ptr().offset(offset as _),
+                    buf.len(),
+                )
+            };
+            Ok(buf.len())
+        }
+
+        pub fn flush(&mut self) -> io::Result<()> {
+            if let Some(mem) = self.memory.as_mut() {
+                mem.flush()?;
+            }
+            Ok(())
+        }
+        pub fn read(&mut self, buf: &mut [u8], offset: i64) -> io::Result<usize> {
+            let map = self.get_map()?;
+            let remainder = if map.len() >= offset as usize {
+                map.len() - offset as usize
+            } else {
+                0
+            };
+            let map_size = buf.len().min(remainder);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    map.as_ptr().offset(offset as _),
+                    buf.as_mut_ptr(),
+                    map_size,
+                );
+            }
+            Ok(map_size)
+        }
+    }
 }
 
 type Ino = u64;
+type Fh = u64;
 
 impl LocalMount {
     pub fn new<T: Into<PathBuf>>(root: T) -> Self {
@@ -26,6 +196,7 @@ impl LocalMount {
             root: root.into(),
             ino_paths: HashMap::new(),
             root_ino: 0,
+            open_files: HashMap::new(),
         }
     }
 
@@ -35,6 +206,14 @@ impl LocalMount {
         } else {
             self.ino_paths.get(ino)
         }
+    }
+
+    fn register_new_file(&mut self, file: OpenFile) -> Fh {
+        let fh = file.fh();
+        if !self.open_files.contains_key(&fh) {
+            self.open_files.insert(fh, file);
+        }
+        fh
     }
 }
 
@@ -51,6 +230,7 @@ impl Filesystem for LocalMount {
     }
 
     fn destroy(&mut self, _req: &Request<'_>) {
+        self.open_files.clear();
         log::info!("File system destroyed")
     }
 
@@ -64,14 +244,26 @@ impl Filesystem for LocalMount {
     /// structure in <fuse_common.h> for more details.
     fn open(&mut self, _req: &Request<'_>, ino: Ino, flags: i32, reply: ReplyOpen) {
         if let Some(path) = self.at_ino(&ino) {
-            log::trace!("Open called on ino {:?} = {:?}", ino, path);
-            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-            let res = unsafe { libc::open(path.as_ptr(), flags) };
-            if res >= 0 {
-                reply.opened(res as u64, flags as u32);
-            } else {
-                reply.error(errno());
+            match FileBuilder::new()
+                .flags(flags)
+                .write(true)
+                .read(true)
+                .path(path)
+            {
+                Ok(file) => {
+                    let fh = self.register_new_file(file);
+                    reply.opened(fh as _, flags as _);
+                }
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
             }
+            // log::trace!("Open called on ino {:?} = {:?}", ino, path);
+            // let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // let res = unsafe { libc::open(path.as_ptr(), flags) };
+            // if res >= 0 {
+            //     reply.opened(res as u64, flags as u32);
+            // } else {
+            //     reply.error(errno());
+            // }
         } else {
             log::error!("Open failed with invalid ino {:?}", ino);
             reply.error(libc::EIO);
@@ -314,6 +506,7 @@ impl Filesystem for LocalMount {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        // TODO: revalidate the [ino <-> path] map
         let res = try {
             let old_name = CString::new(name.as_bytes()).unwrap();
             let newname = CString::new(newname.as_bytes()).unwrap();
@@ -384,20 +577,55 @@ impl Filesystem for LocalMount {
         _req: &Request<'_>,
         _ino: u64,
         fh: u64,
-        _offset: i64,
+        offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        log::trace!("Writing to fh {:?}", fh);
-        let mut buf = vec![0; size as usize];
-        let bytes_read = unsafe { libc::read(fh as _, buf.as_mut_ptr() as _, size as usize) };
-        if bytes_read != -1 {
-            reply.data(&buf);
+        log::info!("reading {} bytes from fh {:?}", size, fh);
+        let size = size as usize;
+        if let Some(f) = self.open_files.get_mut(&(fh as _)) {
+            let mut buf = vec![0; size];
+            match f.read(&mut buf, offset) {
+                Ok(bytes_read) => {
+                    log::info!("Read {} bytes into file {}", bytes_read, fh);
+                    reply.data(&buf);
+                }
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(1) as _),
+            }
         } else {
-            reply.error(errno());
+            reply.error(libc::EBADF)
         }
+        //     let mem = f.memory.as_ref();
+        //     let size = size as usize;
+        //     let remainder = mem.len() - f.seek;
+        //     if size > remainder {
+        //         let mut buf: Vec<u8> = vec![0; size];
+        //         unsafe {
+        //             std::ptr::copy_nonoverlapping(
+        //                 mem.as_ptr().offset(f.seek as _),
+        //                 (&mut buf).as_mut_ptr(),
+        //                 remainder,
+        //             );
+        //         }
+        //         buf[remainder + 1] = libc::EOF as _;
+
+        //         f.seek = mem.len();
+        //     } else {
+        //         reply.data(&mem[f.seek..size]);
+        //         f.seek += size;
+        //     }
+        // }
+        //
+        // Working non-mapped section
+        // let mut buf = vec![0; size as usize];
+        // let bytes_read = unsafe { libc::read(fh as _, buf.as_mut_ptr() as _, size as usize) };
+        // if bytes_read != -1 {
+        //     reply.data(&buf);
+        // } else {
+        //     reply.error(errno());
+        // }
     }
 
     /// Write data.
@@ -417,7 +645,7 @@ impl Filesystem for LocalMount {
         _req: &Request<'_>,
         _ino: u64,
         fh: u64,
-        _offset: i64,
+        offset: i64,
         data: &[u8],
         _write_flags: u32,
         _flags: i32,
@@ -425,14 +653,30 @@ impl Filesystem for LocalMount {
         reply: ReplyWrite,
     ) {
         log::info!("Attempting to write to file at handle: {:?}", fh);
-        let bytes_written = unsafe { libc::write(fh as _, data.as_ptr() as _, data.len()) };
-        if bytes_written != -1 {
-            log::trace!("wrote {:?} bytes to fh {:?}", bytes_written, fh);
-            reply.written(bytes_written as _);
+        if let Some(f) = self.open_files.get_mut(&fh) {
+            match f.write(data, offset) {
+                Ok(len) => reply.written(len as _),
+                Err(e) => {
+                    log::error!("Failed to wtite bytes: {}", e);
+                    reply.error(e.raw_os_error().unwrap());
+                }
+            }
         } else {
-            log::error!("Failed to write bytes to fh {:?}", fh);
-            reply.error(errno());
+            log::error!(
+                "Failed to write bytes to fh {:?}, could not find open file. There are {} open files.",
+                fh, self.open_files.keys().len()
+            );
+            reply.error(0);
         }
+        // Safe non mmap IO version
+        // let bytes_written = unsafe { libc::write(fh as _, data.as_ptr() as _, data.len()) };
+        // if bytes_written != -1 {
+        //     log::trace!("wrote {:?} bytes to fh {:?}", bytes_written, fh);
+        //     reply.written(bytes_written as _);
+        // } else {
+        //     log::error!("Failed to write bytes to fh {:?}", fh);
+        //     reply.error(errno());
+        // }
     }
 
     /// Flush method.
@@ -453,17 +697,27 @@ impl Filesystem for LocalMount {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        let res = unsafe { libc::close(fh as _) };
-        if res != 0 {
-            log::error!(
-                "flush: close syscall failed on fh {:?} with errorno: {:?}.",
-                fh,
-                res
-            );
-            reply.error(errno());
+        if let Some(f) = self.open_files.get_mut(&fh) {
+            if let Some(r) = f.flush().err() {
+                reply.error(r.raw_os_error().unwrap());
+            } else {
+                reply.ok();
+            }
         } else {
-            reply.ok();
+            reply.error(libc::ENOENT);
         }
+        // non mmap io version
+        // let res = unsafe { libc::close(fh as _) };
+        // if res != 0 {
+        //     log::error!(
+        //         "flush: close syscall failed on fh {:?} with errorno: {:?}.",
+        //         fh,
+        //         res
+        //     );
+        //     reply.error(errno());
+        // } else {
+        //     reply.ok();
+        // }
     }
 
     /// Release an open file.
@@ -477,13 +731,15 @@ impl Filesystem for LocalMount {
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        ino: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        log::trace!("Released file {:?} with fh {:?}", self.at_ino(&ino), fh);
+        self.open_files.remove(&fh);
         reply.ok();
     }
 
@@ -494,12 +750,16 @@ impl Filesystem for LocalMount {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
+        fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        log::error!("fsync called but not yet implmeneted");
-        reply.error(ENOSYS);
+        if let Some(f) = self.open_files.get_mut(&fh) {
+            match f.flush() {
+                Ok(_) => reply.ok(),
+                Err(e) => reply.error(e.raw_os_error().unwrap()),
+            }
+        }
     }
 
     /// Open a directory.
@@ -769,23 +1029,45 @@ impl Filesystem for LocalMount {
         log::info!("create called on file");
         if let Some(parent) = self.at_ino(&parent) {
             let path = parent.join(name);
-            let c_str = CString::new(path.as_os_str().as_bytes())
-                .expect("Path does not have a null terminator");
-            let fd = unsafe { libc::open(c_str.as_ptr(), flags | libc::O_CREAT | libc::O_TRUNC) };
-            if fd >= 0 {
-                let attr = fs::metadata(&path).unwrap();
-                self.ino_paths.insert(attr.ino(), path);
-                reply.created(
-                    &std::time::Duration::ZERO,
-                    &(&attr).into(),
-                    0,
-                    fd as _,
-                    flags as _,
-                );
-            } else {
-                log::error!("Failed to create file {:?} with errno {:?}", name, errno());
-                reply.error(errno());
-            }
+            let file = match FileBuilder::new()
+                .flags(flags)
+                .create(true)
+                .trunc(true)
+                .path(&path)
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    reply.error(e.raw_os_error().unwrap());
+                    return;
+                }
+            };
+            let meta = file.metadata().expect("already called, so should work");
+            self.ino_paths.insert(meta.ino(), path);
+            let fd = self.register_new_file(file);
+            reply.created(
+                &std::time::Duration::ZERO,
+                &(&meta).into(),
+                0,
+                fd as _,
+                flags as _,
+            )
+
+        // let c_str = CString::new(path.as_os_str().as_bytes())
+        //     .expect("Path does not have a null terminator");
+        // let fd = unsafe { libc::open(c_str.as_ptr(), flags | libc::O_CREAT | libc::O_TRUNC) };
+        // if fd >= 0 {
+        //     let attr = fs::metadata(&path).unwrap();
+        //     self.ino_paths.insert(attr.ino(), path);
+        //     reply.created(
+        //         &std::time::Duration::ZERO,
+        //         &(&attr).into(),
+        //         0,
+        //         fd as _,
+        //         flags as _,
+        //     );
+        } else {
+            log::error!("Failed to create file {:?} with errno {:?}", name, errno());
+            reply.error(errno());
         }
     }
 
