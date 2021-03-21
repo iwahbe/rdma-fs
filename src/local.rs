@@ -23,10 +23,7 @@ use file::{FileBuilder, OpenFile};
 mod file {
     use super::Fh;
     use memmap;
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::FromRawFd;
     use std::path::Path;
     use std::{fs, io};
 
@@ -37,13 +34,12 @@ mod file {
         fh: Fh,
     }
 
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub struct FileBuilder {
         create: bool,
         read: bool,
         write: bool,
         trunc: bool,
-        raw_flags: i32,
     }
 
     impl FileBuilder {
@@ -53,7 +49,6 @@ mod file {
                 read: false,
                 write: false,
                 trunc: false,
-                raw_flags: 0,
             }
         }
 
@@ -72,40 +67,31 @@ mod file {
             self
         }
 
+        /// Setts the flag to O_TRUNC
         pub fn trunc(mut self, trunc: bool) -> Self {
             self.trunc = trunc;
             self
         }
 
-        pub fn flags(mut self, flags: i32) -> Self {
-            self.raw_flags |= flags;
-            self
+        /// Build a set of open flags from C flags
+        pub fn from_flags(flags: i32) -> Self {
+            use libc::*;
+            Self::new()
+                .read(flags & O_RDONLY != 0)
+                .write(flags & O_WRONLY != 0)
+                .create(flags & O_CREAT != 0)
+                .trunc(flags & O_TRUNC != 0)
         }
 
         /// Creates a new openfile from unix flags
         pub fn path(self, path: &Path) -> io::Result<OpenFile> {
-            use libc::*;
-            let mut raw_flags = self.raw_flags;
-            if self.read && self.write {
-                raw_flags |= O_RDWR
-            } else if self.read {
-                raw_flags |= O_RDONLY
-            } else if self.write {
-                raw_flags |= O_WRONLY
-            }
-            if self.create {
-                raw_flags |= O_CREAT
-            }
-            if self.trunc {
-                raw_flags |= O_TRUNC
-            }
-            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-
-            let res = unsafe { creat(path.as_ptr(), raw_flags as _) };
-            if res < 0 {
-                panic!("Bad create!!!")
-            }
-            let file = unsafe { fs::File::from_raw_fd(res) };
+            let file = fs::OpenOptions::new()
+                .truncate(self.trunc)
+                .read(self.read)
+                .write(self.write)
+                .create(self.create)
+                .open(path)?;
+            // let file = unsafe { fs::File::from_raw_fd(res) };
 
             let meta = file.metadata()?;
             let fh = meta.ino() as _;
@@ -127,9 +113,12 @@ mod file {
         /// previous file size.
         pub fn truncate(&mut self, size: u64) -> io::Result<()> {
             self.memory.take();
-            self.file.set_len(size)?;
-            let meta = self.file.metadata()?;
-            self.len = meta.len();
+            let trunc = self.file.set_len(size);
+            if trunc.is_err() {
+                log::error!("Failed to truncate on fh {:?}", self.fh);
+                trunc?
+            }
+            self.len = size;
             Ok(())
         }
 
@@ -140,8 +129,26 @@ mod file {
 
         /// Get a reference to the backing memory.
         fn get_map(&mut self) -> io::Result<&mut memmap::MmapMut> {
+            log::info!("Get map was called on file {:?}", self.fh);
             if self.memory.is_none() {
-                self.memory = Some(unsafe { memmap::MmapOptions::new().map_mut(&self.file)? });
+                let meta = self.file.metadata()?;
+                self.memory = Some(unsafe {
+                    match memmap::MmapOptions::new()
+                        .len(meta.len().max(0) as _)
+                        .map_mut(&self.file)
+                    {
+                        Ok(k) => k,
+                        Err(e) => {
+                            log::error!(
+                                "Failed to mmap file {:?} with error {}. File size is {}",
+                                self.fh,
+                                e,
+                                meta.len()
+                            );
+                            Err(e)?
+                        }
+                    }
+                });
             }
             Ok(unsafe { self.memory.as_mut().unwrap_unchecked() })
         }
@@ -244,10 +251,9 @@ impl Filesystem for LocalMount {
     /// structure in <fuse_common.h> for more details.
     fn open(&mut self, _req: &Request<'_>, ino: Ino, flags: i32, reply: ReplyOpen) {
         if let Some(path) = self.at_ino(&ino) {
-            match FileBuilder::new()
-                .flags(flags)
-                .write(true)
+            match FileBuilder::from_flags(flags)
                 .read(true)
+                .write(true)
                 .path(path)
             {
                 Ok(file) => {
@@ -583,7 +589,6 @@ impl Filesystem for LocalMount {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        log::info!("reading {} bytes from fh {:?}", size, fh);
         let size = size as usize;
         if let Some(f) = self.open_files.get_mut(&(fh as _)) {
             let mut buf = vec![0; size];
@@ -1026,17 +1031,18 @@ impl Filesystem for LocalMount {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        log::info!("create called on file");
         if let Some(parent) = self.at_ino(&parent) {
             let path = parent.join(name);
-            let file = match FileBuilder::new()
-                .flags(flags)
+            log::info!("create called on file {:?}", path);
+            let file = match FileBuilder::from_flags(flags)
                 .create(true)
-                .trunc(true)
+                .read(true)
+                .write(true)
                 .path(&path)
             {
                 Ok(k) => k,
                 Err(e) => {
+                    log::error!("Failed to create file {:?} with error: {}", path, e);
                     reply.error(e.raw_os_error().unwrap());
                     return;
                 }
