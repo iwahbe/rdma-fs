@@ -22,13 +22,13 @@ pub struct LocalMount {
 use file::{FileBuilder, OpenFile};
 mod file {
     use super::Fh;
-    use memmap;
+    use memmap2;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::{fs, io};
 
     pub struct OpenFile {
-        memory: Option<memmap::MmapMut>,
+        memory: Option<memmap2::MmapMut>,
         file: fs::File,
         len: u64,
         fh: Fh,
@@ -128,12 +128,12 @@ mod file {
         }
 
         /// Get a reference to the backing memory.
-        fn get_map(&mut self) -> io::Result<&mut memmap::MmapMut> {
+        fn get_map(&mut self) -> io::Result<&mut memmap2::MmapMut> {
             log::info!("Get map was called on file {:?}", self.fh);
             if self.memory.is_none() {
                 let meta = self.file.metadata()?;
                 self.memory = Some(unsafe {
-                    match memmap::MmapOptions::new()
+                    match memmap2::MmapOptions::new()
                         .len(meta.len().max(0) as _)
                         .map_mut(&self.file)
                     {
