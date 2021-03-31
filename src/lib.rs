@@ -3,5 +3,6 @@
 #![feature(option_result_unwrap_unchecked)]
 
 mod local;
+mod remote;
 
 pub use local::LocalMount;

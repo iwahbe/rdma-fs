@@ -3,3 +3,7 @@
 * Notes
 - Filesystem stat => get inode
 - Then direct map for all nodes but root (which must be 1 on fuse)
+
+* Figure out how to configure RDMA
+** How to set ports when building q-pairs
+** Report on sate of setup by Wensday

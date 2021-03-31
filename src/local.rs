@@ -27,6 +27,7 @@ mod file {
     use std::path::Path;
     use std::{fs, io};
 
+    #[derive(Debug)]
     pub struct OpenFile {
         memory: Option<memmap2::MmapMut>,
         file: fs::File,
