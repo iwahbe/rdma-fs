@@ -6,4 +6,7 @@
 
 * Figure out how to configure RDMA
 ** How to set ports when building q-pairs
+*** On the =chimera=
+*** On the VM
+Both got =entity not found=
 ** Report on sate of setup by Wensday

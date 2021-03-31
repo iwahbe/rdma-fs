@@ -46,15 +46,22 @@ fn main() -> io::Result<()> {
         if matches.is_present("sender") {
             let r = test_rdma(true);
             match &r {
-                Ok(_) => println!("RDMA send!"),
-                Err(e) => println!("Send failed: {}", e),
+                Ok(_) => println!("RDMA sent!"),
+                Err(e) => {
+                    println!("Send failed: {}", e);
+                    // Exit will leak memory. This should not matter.
+                    std::process::exit(1)
+                }
             }
             return r;
         } else if matches.is_present("receiver") {
             let r = test_rdma(false);
             match &r {
                 Ok(_) => println!("RDMA received!"),
-                Err(e) => println!("Recieve failed: {}", e),
+                Err(e) => {
+                    println!("Recieve failed: {}", e);
+                    std::process::exit(1)
+                }
             }
             return r;
         } else {
@@ -68,23 +75,10 @@ fn main() -> io::Result<()> {
                 .spawn()?;
             let sender = sender.wait_with_output()?;
             let reciever = reciever.wait_with_output()?;
-            if !sender.status.success() {
-                println!(
-                    "Sender failed\n{}",
-                    String::from_utf8(sender.stdout).unwrap()
-                );
-            }
-            if !reciever.status.success() {
-                println!(
-                    "Receiver failed\n{}",
-                    String::from_utf8(reciever.stdout).unwrap()
-                );
-            }
-
             if sender.status.success() && reciever.status.success() {
                 return Ok(());
             } else {
-                return Err(io::Error::from(io::ErrorKind::Other));
+                std::process::exit(1);
             }
         }
     }
