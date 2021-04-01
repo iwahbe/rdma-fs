@@ -7,6 +7,11 @@
 * Figure out how to configure RDMA
 ** How to set ports when building q-pairs
 *** On the =chimera=
+Both got =port is not ACTIVE or ARMED=
+#+begin_src sh
+sudo mst start # to create devices
+
+#+end_src
 *** On the VM
 Both got =entity not found=
 ** Report on sate of setup by Wensday

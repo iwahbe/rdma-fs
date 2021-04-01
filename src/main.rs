@@ -1,8 +1,13 @@
+use bincode;
 use clap::{App, Arg, SubCommand};
 use env_logger;
 use fuser::spawn_mount;
 use rdma_fuse::LocalMount;
-use std::{io, io::stdin};
+use std::str::FromStr;
+use std::{
+    io,
+    io::{stdin, Write},
+};
 
 fn main() -> io::Result<()> {
     env_logger::init();
@@ -27,24 +32,40 @@ fn main() -> io::Result<()> {
         )
         .subcommand(
             SubCommand::with_name("test")
-                .about("Run a test, confirming that RDMA exists")
+                .about(
+                    "Run a test, confirming that RDMA exists, and that a connection can be formed",
+                )
                 .arg(
                     Arg::with_name("sender")
+                        .help("This thread will send an rdma message.")
                         .long("sender")
                         .takes_value(false)
                         .conflicts_with("receiver"),
                 )
                 .arg(
                     Arg::with_name("receiver")
+                        .help("This thread will recieve an rdma message.")
                         .long("receiver")
                         .takes_value(false)
                         .conflicts_with("sender"),
+                )
+                .arg(
+                    Arg::with_name("ip")
+                        .short("p")
+                        .long("ip")
+                        .takes_value(true)
+                        .help("What ip (Tcp) address threads will exchange RDMA enpoints over."),
                 ),
         )
         .get_matches();
     if let Some(matches) = &matches.subcommand_matches("test") {
+        let port =
+            std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or("127.0.0.1:8080"))
+                .unwrap();
         if matches.is_present("sender") {
-            let r = test_rdma(true);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let socket = std::net::TcpStream::connect(&port)?;
+            let r = test_rdma(true, socket);
             match &r {
                 Ok(_) => println!("RDMA sent!"),
                 Err(e) => {
@@ -55,7 +76,8 @@ fn main() -> io::Result<()> {
             }
             return r;
         } else if matches.is_present("receiver") {
-            let r = test_rdma(false);
+            let socket = std::net::TcpListener::bind(&port)?.accept()?.0;
+            let r = test_rdma(false, socket);
             match &r {
                 Ok(_) => println!("RDMA received!"),
                 Err(e) => {
@@ -96,7 +118,11 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn test_rdma(sender: bool) -> io::Result<()> {
+/// Initiates a rdma connection as either a sender or reciever.
+///
+/// Communicates an enpoint across `port`, and either sends or receives based on
+/// `sender`.
+fn test_rdma(sender: bool, mut port: std::net::TcpStream) -> io::Result<()> {
     let ctx = ibverbs::devices()?
         .iter()
         .next()
@@ -113,6 +139,9 @@ fn test_rdma(sender: bool) -> io::Result<()> {
         .build()?;
 
     let endpoint = qp_builder.endpoint();
+    let encode: Vec<u8> = bincode::serialize(&endpoint).unwrap();
+    port.write(&encode)?;
+    let endpoint: ibverbs::QueuePairEndpoint = bincode::deserialize_from(&mut port).unwrap();
     let mut qp = qp_builder.handshake(endpoint)?;
 
     let mut mr = pd.allocate::<u64>(2)?;
@@ -127,7 +156,7 @@ fn test_rdma(sender: bool) -> io::Result<()> {
     let mut sent = false;
     let mut received = false;
     let mut completions = [ibverbs::ibv_wc::default(); 16];
-    while !sent || !received {
+    while !sent && !received {
         let completed = cq
             .poll(&mut completions[..])
             .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))?;
@@ -138,15 +167,13 @@ fn test_rdma(sender: bool) -> io::Result<()> {
         for wr in completed {
             match wr.wr_id() {
                 1 => {
-                    assert!(!sent);
+                    assert!(!sent && sender);
                     sent = true;
-                    println!("sent");
                 }
                 2 => {
-                    assert!(!received);
+                    assert!(!received && !sender);
                     received = true;
                     assert_eq!(mr[0], 0x42);
-                    println!("received");
                 }
                 _ => unreachable!(),
             }
