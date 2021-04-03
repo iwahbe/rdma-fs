@@ -14,4 +14,10 @@ sudo mst start # to create devices
 #+end_src
 *** On the VM
 Both got =entity not found=
-** Report on sate of setup by Wensday
+*** On the card
+ip not configured
+** Setting up on bfn1
+- Perftest (RDMA) testing suite
+- ib_test_write
+- ib_test_read
+- ib_* for all tests

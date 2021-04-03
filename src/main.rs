@@ -54,7 +54,13 @@ fn main() -> io::Result<()> {
                         .short("p")
                         .long("ip")
                         .takes_value(true)
-                        .help("What ip (Tcp) address threads will exchange RDMA enpoints over."),
+                        .help("What ip (Tcp) address threads will exchange RDMA enpoints over.")
+                        .validator(|s| match std::net::SocketAddr::from_str(&s) {
+                            Ok(_) => Ok(()),
+                            Err(e) => {
+                                Err(format!("{}, value should be formated as 127.0.0.1:8000", e))
+                            }
+                        }),
                 ),
         )
         .get_matches();
