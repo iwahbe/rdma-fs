@@ -206,8 +206,9 @@ checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 
 [[package]]
 name = "ibverbs"
-version = "0.4.4"
-source = "git+https://github.com/iwahbe/rust-ibverbs.git?branch=serialize-qpendpoint-try2#adcdb9fdb88aed6a811e0c82d06e58f1c420a01b"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "768f6f455b56f8f691c503e0ddfc433275c4ae34f99a1667c7b5878770cab5d9"
 dependencies = [
  "bindgen",
  "serde",

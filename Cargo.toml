@@ -15,5 +15,5 @@ clap = "2.33"
 log = "0.4"
 env_logger = "0.8"
 memmap2 = "0.2"
-ibverbs = { version = "0.4", git = "https://github.com/iwahbe/rust-ibverbs.git", branch = "serialize-qpendpoint-try2" }
+ibverbs = "0.4"
 bincode = "1.3"

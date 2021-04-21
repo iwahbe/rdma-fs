@@ -146,7 +146,7 @@ mod file {
                                 e,
                                 meta.len()
                             );
-                            Err(e)?
+                            return Err(e);
                         }
                     }
                 });
@@ -218,9 +218,7 @@ impl LocalMount {
 
     fn register_new_file(&mut self, file: OpenFile) -> Fh {
         let fh = file.fh();
-        if !self.open_files.contains_key(&fh) {
-            self.open_files.insert(fh, file);
-        }
+        self.open_files.entry(fh).or_insert(file);
         fh
     }
 }
@@ -817,7 +815,7 @@ impl Filesystem for LocalMount {
                             std::io::Error::from_raw_os_error(errno()),
                             self.at_ino(&ino)
                                 .map(|b| b.as_os_str())
-                                .unwrap_or(OsStr::new("Unknown")),
+                                .unwrap_or_else(|| OsStr::new("Unknown")),
                             fh
                         );
                         return;
@@ -829,23 +827,29 @@ impl Filesystem for LocalMount {
             let file_len = unsafe { CStr::from_ptr(dir_ent.d_name.as_ptr() as _) }
                 .to_bytes()
                 .len();
-            let file =
-                OsStr::from_bytes(unsafe { std::mem::transmute(&dir_ent.d_name[..file_len]) });
+            let file = OsStr::from_bytes(unsafe {
+                &*(&dir_ent.d_name[..file_len] as *const [i8] as *const [u8])
+            });
             log::trace!("File {:?} under dir {:?}", file, ino);
 
             if dir_ent.d_ino == 0 {
                 continue; // file has been deleted, but has not yet been removed
             }
 
+            // This conversion is not always necessary on all systems.
             // The seek data has different names on different OSs
+            #[allow(clippy::useless_conversion)]
             #[cfg(target_os = "macos")]
-            let seek = dir_ent.d_seekoff;
+            let seek = dir_ent
+                .d_seekoff
+                .try_into()
+                .expect("File length does not fit into i64");
             #[cfg(not(target_os = "macos"))]
             let seek = dir_ent.d_off;
 
             let full = reply.add(
                 dir_ent.d_ino,
-                seek.try_into().expect("File length does not fit into i64"),
+                seek,
                 dir_ent.d_type.try_into().expect("Unknown file type"),
                 file,
             );
