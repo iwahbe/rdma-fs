@@ -367,6 +367,7 @@ dependencies = [
  "log",
  "memmap2",
  "nix",
+ "serde",
 ]
 
 [[package]]

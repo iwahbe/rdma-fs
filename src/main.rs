@@ -1,22 +1,31 @@
-use bincode;
 use clap::{App, Arg, SubCommand};
 use env_logger;
 use fuser::spawn_mount;
-use rdma_fuse::LocalMount;
+use rdma_fuse::{remote_server, LocalMount, RDMAConnection, RDMAFs};
 use std::str::FromStr;
-use std::{
-    io,
-    io::{stdin, Write},
-};
+use std::{io, io::stdin, path::PathBuf};
+
+const DEFAULT_PORT: &str = "127.0.0.1:8080";
 
 fn main() -> io::Result<()> {
     env_logger::init();
+    let ip_arg = Arg::with_name("ip")
+        .short("p")
+        .long("ip")
+        .takes_value(true)
+        .help("What ip (Tcp) address threads will exchange RDMA enpoints over.")
+        .validator(|s| match std::net::SocketAddr::from_str(&s) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("{}, value should be formated as 127.0.0.1:8000", e)),
+        });
     let matches = App::new("Passthrough FS")
         .version("0.1")
         .author("Ian wahbe")
         .subcommand(
             SubCommand::with_name("local")
-                .about("Mount a local filesystem")
+                .about(
+                    "Mount a local filesystem, mirroring another point on the current file system",
+                )
                 .arg(
                     Arg::with_name("mount at")
                         .index(1)
@@ -49,29 +58,35 @@ fn main() -> io::Result<()> {
                         .takes_value(false)
                         .conflicts_with("sender"),
                 )
+                .arg(ip_arg.clone()),
+        )
+        .subcommand(
+            SubCommand::with_name("remote")
+                .about("Facilitate file system mirroring over RDMA")
                 .arg(
-                    Arg::with_name("ip")
-                        .short("p")
-                        .long("ip")
+                    Arg::with_name("client")
+                        .help("Provide the local file system, talking to a remote host to get data")
+                        .long("client")
+                        .takes_value(false)
+                        .conflicts_with("host"),
+                )
+                .arg(
+                    Arg::with_name("host")
+                        .help("Provides the remote end of an RDMA file sytem.")
+                        .long("host")
                         .takes_value(true)
-                        .help("What ip (Tcp) address threads will exchange RDMA enpoints over.")
-                        .validator(|s| match std::net::SocketAddr::from_str(&s) {
-                            Ok(_) => Ok(()),
-                            Err(e) => {
-                                Err(format!("{}, value should be formated as 127.0.0.1:8000", e))
-                            }
-                        }),
-                ),
+                        .conflicts_with("client"),
+                )
+                .arg(ip_arg),
         )
         .get_matches();
     if let Some(matches) = &matches.subcommand_matches("test") {
-        let port =
-            std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or("127.0.0.1:8080"))
-                .unwrap();
+        let port = std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT))
+            .unwrap();
         if matches.is_present("sender") {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let socket = std::net::TcpStream::connect(&port)?;
-            let r = test_rdma(true, socket);
+            let mut socket = std::net::TcpStream::connect(&port)?;
+            let r = test_rdma(true, &mut socket);
             match &r {
                 Ok(_) => println!("RDMA sent!"),
                 Err(e) => {
@@ -82,8 +97,8 @@ fn main() -> io::Result<()> {
             }
             return r;
         } else if matches.is_present("receiver") {
-            let socket = std::net::TcpListener::bind(&port)?.accept()?.0;
-            let r = test_rdma(false, socket);
+            let mut socket = std::net::TcpListener::bind(&port)?.accept()?.0;
+            let r = test_rdma(false, &mut socket);
             match &r {
                 Ok(_) => println!("RDMA received!"),
                 Err(e) => {
@@ -121,6 +136,30 @@ fn main() -> io::Result<()> {
         println!("Return on input");
         stdin().read_line(&mut s).expect("Failed to read input");
     }
+
+    if let Some(matches) = &matches.subcommand_matches("remote") {
+        let port = std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT))
+            .unwrap();
+        if let Some(mountpoint) = matches
+            .value_of_lossy("host")
+            .map(|s| PathBuf::from_str(&s).unwrap())
+        {
+            let con = std::net::TcpStream::connect(&port)?;
+            let mut con = RDMAConnection::new(1, con)?;
+            remote_server(mountpoint, &mut con)?;
+        } else {
+            let con = std::net::TcpListener::bind(&port)?.accept()?.0;
+            let mountpoint = matches
+                .value_of_lossy("client")
+                .map(|s| PathBuf::from_str(&s).unwrap())
+                .unwrap();
+            // We are the client
+            let _backround = spawn_mount(RDMAFs::new(con)?, mountpoint, &[]).unwrap();
+            let mut s = String::new();
+            println!("Return on input");
+            stdin().read_line(&mut s).expect("Failed to read input");
+        }
+    }
     Ok(())
 }
 
@@ -128,63 +167,14 @@ fn main() -> io::Result<()> {
 ///
 /// Communicates an enpoint across `port`, and either sends or receives based on
 /// `sender`.
-fn test_rdma(sender: bool, mut port: std::net::TcpStream) -> io::Result<()> {
-    let ctx = ibverbs::devices()?
-        .iter()
-        .next()
-        .ok_or(io::Error::from(io::ErrorKind::NotFound))?
-        .open()?;
-
-    let cq = ctx.create_cq(16, 0)?;
-    let pd = ctx
-        .alloc_pd()
-        .map_err(|_| io::Error::from(io::ErrorKind::AddrNotAvailable))?;
-
-    let qp_builder = pd
-        .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
-        .build()?;
-
-    let endpoint = qp_builder.endpoint();
-    let encode: Vec<u8> = bincode::serialize(&endpoint).unwrap();
-    port.write(&encode)?;
-    let endpoint: ibverbs::QueuePairEndpoint = bincode::deserialize_from(&mut port).unwrap();
-    let mut qp = qp_builder.handshake(endpoint)?;
-
-    let mut mr = pd.allocate::<u64>(2)?;
-    mr[1] = 0x42;
-
+fn test_rdma(sender: bool, port: &mut std::net::TcpStream) -> io::Result<()> {
+    let mut con: RDMAConnection<usize> = RDMAConnection::new(1, port)?;
     if sender {
-        unsafe { qp.post_send(&mut mr, 1.., 1) }?;
+        con[0] = 42;
+        con.send()?;
     } else {
-        unsafe { qp.post_receive(&mut mr, ..1, 2) }?;
+        con.recv()?;
+        assert_eq!(42, con[0]);
     }
-
-    let mut sent = false;
-    let mut received = false;
-    let mut completions = [ibverbs::ibv_wc::default(); 16];
-    while !sent && !received {
-        let completed = cq
-            .poll(&mut completions[..])
-            .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))?;
-        if completed.is_empty() {
-            continue;
-        }
-        assert!(completed.len() <= 2);
-        for wr in completed {
-            match wr.wr_id() {
-                1 => {
-                    assert!(!sent && sender);
-                    sent = true;
-                }
-                2 => {
-                    assert!(!received && !sender);
-                    received = true;
-                    assert_eq!(mr[0], 0x42);
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
     Ok(())
 }

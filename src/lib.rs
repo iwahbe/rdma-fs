@@ -3,10 +3,12 @@
 #![feature(duration_zero)]
 #![feature(option_result_unwrap_unchecked)]
 
+mod file;
 mod local;
 mod remote;
 
 pub use local::LocalMount;
+pub use remote::{remote_server, Message, RDMAFs};
 
 use bincode;
 use ibverbs::{CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair};
@@ -18,17 +20,20 @@ use std::{
     ops::DerefMut,
 };
 
-struct RDMAConnection<T>
+pub type Ino = u64;
+pub type Fh = u64;
+
+pub struct RDMAConnection<T>
 where
     T: Copy + Default,
 {
     // This is unsafe as f**k
     // We need the fields to drop in this order to avoid ub
-    pub mem: MemoryRegion<T>,
-    pub qp: QueuePair<'static>,
-    pd: Pin<Box<ProtectionDomain<'static>>>,
+    mem: MemoryRegion<T>,
+    qp: QueuePair<'static>,
+    _pd: Pin<Box<ProtectionDomain<'static>>>,
     cq: Pin<Box<CompletionQueue<'static>>>,
-    ctx: Pin<Box<Context>>,
+    _ctx: Pin<Box<Context>>,
     next_id: u64,
 }
 
@@ -36,6 +41,8 @@ impl<T> RDMAConnection<T>
 where
     T: Copy + Default,
 {
+    // Creates a new `RDMAConnection`. This is a wrapper around a
+    // `MemoryRegion<T>`, with all the context needed to read and write to it.
     pub fn new<W>(size: usize, mut connection: W) -> io::Result<Self>
     where
         W: Read + Write,
@@ -49,6 +56,9 @@ where
                     .open()?,
             )
         });
+
+        // Unsafe: We cast the lifetime to static. This is safe because we embed
+        // this all in the same struct.
         let cq: Pin<Box<CompletionQueue<'static>>> =
             Box::pin(unsafe { transmute(ctx.as_ref().create_cq(16, 0)?) });
         let pd: Pin<Box<ProtectionDomain<'static>>> = Box::pin(unsafe {
@@ -59,12 +69,9 @@ where
         });
 
         let qp_builder = unsafe {
+            let cq: &'static CompletionQueue = &*(&*cq as *const CompletionQueue);
             transmute::<_, &'static ProtectionDomain<'static>>(pd.as_ref())
-                .create_qp(
-                    &*(&cq as *const _ as *const CompletionQueue),
-                    &*(&cq as *const _ as *const CompletionQueue),
-                    ibverbs::ibv_qp_type::IBV_QPT_RC,
-                )
+                .create_qp(cq, cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
                 .build()?
         };
 
@@ -81,22 +88,44 @@ where
 
         Ok(RDMAConnection {
             cq,
-            ctx,
-            pd,
+            _ctx: ctx,
+            _pd: pd,
             qp,
             mem,
             next_id: 0,
         })
     }
 
-    fn send(&mut self) -> io::Result<()> {
-        unsafe { self.qp.post_send(&mut self.mem, .., self.next_id)? }
-        self.next_id += 1; // TODO: what was I doing with `self.next_id`
-        Ok(())
+    // Send the entire buffer back.
+    pub fn send(&mut self) -> io::Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        unsafe { self.qp.post_send(&mut self.mem, .., id) }?;
+        self.complete(id)
     }
 
-    fn recv(&mut self) -> io::Result<()> {
-        unsafe { self.qp.post_receive(&mut self.mem, .., self.next_id) }
+    // recieve on the buffer.
+    pub fn recv(&mut self) -> io::Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        unsafe { self.qp.post_receive(&mut self.mem, .., id) }?;
+        self.complete(id)
+    }
+
+    // Waits on the completion of a send or recieve with a matching `id`.
+    fn complete(&mut self, id: u64) -> io::Result<()> {
+        let mut completions = [ibverbs::ibv_wc::default(); 16];
+        loop {
+            let completed = self
+                .cq
+                .poll(&mut completions[..])
+                .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))?;
+            for wr in completed {
+                if wr.wr_id() == id {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
@@ -104,10 +133,10 @@ impl<T> Deref for RDMAConnection<T>
 where
     T: Copy + Default,
 {
-    type Target = T;
+    type Target = [T];
 
     fn deref(&self) -> &Self::Target {
-        &self.mem[0]
+        &self.mem
     }
 }
 
@@ -116,6 +145,6 @@ where
     T: Copy + Default,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.mem[0]
+        &mut self.mem
     }
 }
