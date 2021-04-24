@@ -88,14 +88,6 @@ impl Filesystem for LocalMount {
                 }
                 Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
             }
-            // log::trace!("Open called on ino {:?} = {:?}", ino, path);
-            // let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-            // let res = unsafe { libc::open(path.as_ptr(), flags) };
-            // if res >= 0 {
-            //     reply.opened(res as u64, flags as u32);
-            // } else {
-            //     reply.error(errno());
-            // }
         } else {
             log::error!("Open failed with invalid ino {:?}", ino);
             reply.error(libc::EIO);
@@ -225,22 +217,6 @@ impl Filesystem for LocalMount {
             Ok(k) => reply.data(k),
             Err(e) => reply.error(e),
         }
-    }
-
-    /// Create file node.
-    /// Create a regular file, character device, block device, fifo or socket node.
-    fn mknod(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        log::error!("mknod not yet implemented for {:?}", name);
-        reply.error(ENOSYS);
     }
 
     /// Create a directory.
@@ -470,15 +446,6 @@ impl Filesystem for LocalMount {
             );
             reply.error(0);
         }
-        // Safe non mmap IO version
-        // let bytes_written = unsafe { libc::write(fh as _, data.as_ptr() as _, data.len()) };
-        // if bytes_written != -1 {
-        //     log::trace!("wrote {:?} bytes to fh {:?}", bytes_written, fh);
-        //     reply.written(bytes_written as _);
-        // } else {
-        //     log::error!("Failed to write bytes to fh {:?}", fh);
-        //     reply.error(errno());
-        // }
     }
 
     /// Flush method.
@@ -508,18 +475,6 @@ impl Filesystem for LocalMount {
         } else {
             reply.error(libc::ENOENT);
         }
-        // non mmap io version
-        // let res = unsafe { libc::close(fh as _) };
-        // if res != 0 {
-        //     log::error!(
-        //         "flush: close syscall failed on fh {:?} with errorno: {:?}.",
-        //         fh,
-        //         res
-        //     );
-        //     reply.error(errno());
-        // } else {
-        //     reply.ok();
-        // }
     }
 
     /// Release an open file.
@@ -663,23 +618,6 @@ impl Filesystem for LocalMount {
         log::trace!("Read directory at ino: {}", ino);
     }
 
-    /// Read directory.
-    /// Send a buffer filled using buffer.fill(), with size not exceeding the
-    /// requested size. Send an empty buffer on end of stream. fh will contain the
-    /// value set by the opendir method, or will be undefined if the opendir method
-    /// didn't set any value.
-    fn readdirplus(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _offset: i64,
-        reply: ReplyDirectoryPlus,
-    ) {
-        log::error!("Attempting to read directory plus at ino: {}", ino);
-        reply.error(ENOSYS);
-    }
-
     /// Release an open directory.
     /// For every opendir call there will be exactly one releasedir call. fh will
     /// contain the value set by the opendir method, or will be undefined if the
@@ -698,21 +636,6 @@ impl Filesystem for LocalMount {
         } else {
             reply.error(errno());
         }
-    }
-
-    /// Synchronize directory contents.
-    /// If the datasync parameter is set, then only the directory contents should
-    /// be flushed, not the meta data. fh will contain the value set by the opendir
-    /// method, or will be undefined if the opendir method didn't set any value.
-    fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(ENOSYS);
     }
 
     /// Get file system statistics.
@@ -749,52 +672,6 @@ impl Filesystem for LocalMount {
             buf.f_bsize as _, // Hardly ever used:
                               // https://stackoverflow.com/questions/54823541/what-do-f-bsize-and-f-frsize-in-struct-statvfs-stand-for
         );
-    }
-
-    /// Set an extended attribute.
-    fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
-        reply: ReplyEmpty,
-    ) {
-        log::error!("setxattr failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// Get an extended attribute.
-    /// If `size` is 0, the size of the value should be sent with `reply.size()`.
-    /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
-    /// `reply.error(ERANGE)` if it doesn't.
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        log::error!("getxattr failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// List extended attribute names.
-    /// If `size` is 0, the size of the value should be sent with `reply.size()`.
-    /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
-    /// `reply.error(ERANGE)` if it doesn't.
-    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: ReplyXattr) {
-        log::error!("listxattr failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// Remove an extended attribute.
-    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
-        log::error!("removexattr failed: not yet implemented");
-        reply.error(ENOSYS);
     }
 
     /// Check file access permissions.
@@ -860,111 +737,10 @@ impl Filesystem for LocalMount {
                 fd as _,
                 flags as _,
             )
-
-        // let c_str = CString::new(path.as_os_str().as_bytes())
-        //     .expect("Path does not have a null terminator");
-        // let fd = unsafe { libc::open(c_str.as_ptr(), flags | libc::O_CREAT | libc::O_TRUNC) };
-        // if fd >= 0 {
-        //     let attr = fs::metadata(&path).unwrap();
-        //     self.ino_paths.insert(attr.ino(), path);
-        //     reply.created(
-        //         &std::time::Duration::ZERO,
-        //         &(&attr).into(),
-        //         0,
-        //         fd as _,
-        //         flags as _,
-        //     );
         } else {
             log::error!("Failed to create file {:?} with errno {:?}", name, errno());
             reply.error(errno());
         }
-    }
-
-    /// Test for a POSIX file lock.
-    fn getlk(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
-        _start: u64,
-        _end: u64,
-        _typ: i32,
-        _pid: u32,
-        reply: ReplyLock,
-    ) {
-        log::error!("getlk on ino: {:?}", ino);
-        reply.error(ENOSYS);
-    }
-
-    /// Acquire, modify or release a POSIX file lock.
-    /// For POSIX threads (NPTL) there's a 1-1 relation between pid and owner, but
-    /// otherwise this is not always the case.  For checking lock ownership,
-    /// 'fi->owner' must be used. The l_pid field in 'struct flock' should only be
-    /// used to fill in this field in getlk(). Note: if the locking methods are not
-    /// implemented, the kernel will still allow file locking to work locally.
-    /// Hence these are only interesting for network filesystems and similar.
-    fn setlk(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
-        _start: u64,
-        _end: u64,
-        _typ: i32,
-        _pid: u32,
-        _sleep: bool,
-        reply: ReplyEmpty,
-    ) {
-        log::error!("setlk failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// Map block index within file to block index within device.
-    /// Note: This makes sense only for block device backed filesystems mounted
-    /// with the 'blkdev' option
-    fn bmap(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _blocksize: u32,
-        _idx: u64,
-        reply: ReplyBmap,
-    ) {
-        log::error!("bmap failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// control device
-    fn ioctl(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: u32,
-        _cmd: u32,
-        _in_data: &[u8],
-        _out_size: u32,
-        reply: ReplyIoctl,
-    ) {
-        log::error!("ioctl failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// Preallocate or deallocate space to a file
-    fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _length: i64,
-        _mode: i32,
-        reply: ReplyEmpty,
-    ) {
-        log::error!("falocate failed: not yet implemented");
-        reply.error(ENOSYS);
     }
 
     /// Reposition read/write file offset
@@ -984,55 +760,5 @@ impl Filesystem for LocalMount {
         } else {
             reply.offset(offset);
         }
-    }
-
-    /// Copy the specified range from the source inode to the destination inode
-    fn copy_file_range(
-        &mut self,
-        _req: &Request<'_>,
-        _ino_in: u64,
-        _fh_in: u64,
-        _offset_in: i64,
-        _ino_out: u64,
-        _fh_out: u64,
-        _offset_out: i64,
-        _len: u64,
-        _flags: u32,
-        reply: ReplyWrite,
-    ) {
-        log::error!("copy_file_range failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// macOS only: Rename the volume. Set fuse_init_out.flags during init to
-    /// FUSE_VOL_RENAME to enable
-    #[cfg(target_os = "macos")]
-    fn setvolname(&mut self, _req: &Request<'_>, _name: &OsStr, reply: ReplyEmpty) {
-        log::error!("setvolname failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// macOS only (undocumented)
-    #[cfg(target_os = "macos")]
-    fn exchange(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _newparent: u64,
-        _newname: &OsStr,
-        _options: u64,
-        reply: ReplyEmpty,
-    ) {
-        log::error!("exchange failed: not yet implemented");
-        reply.error(ENOSYS);
-    }
-
-    /// macOS only: Query extended times (bkuptime and crtime). Set fuse_init_out.flags
-    /// during init to FUSE_XTIMES to enable
-    #[cfg(target_os = "macos")]
-    fn getxtimes(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyXTimes) {
-        log::error!("getxtimes failed: not yet implemented");
-        reply.error(ENOSYS);
     }
 }

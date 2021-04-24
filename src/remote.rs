@@ -17,14 +17,18 @@ use std::{
 };
 
 const MAX_FILENAME_LENGTH: usize = 255;
+const READ_WRITE_BUFFER_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Message {
     Exit,
+
     Startup {
         server: bool,
     },
+
     Null,
+
     Lookup {
         errno: Option<i32>,
         parent: Ino,
@@ -38,6 +42,7 @@ pub enum Message {
         ino: Ino,
         attr: Option<FileAttr>,
     },
+
     OpenDir {
         errno: Option<i32>,
         ino: Ino,
@@ -45,6 +50,7 @@ pub enum Message {
         fh: Fh,
         open_flags: u32,
     },
+
     ReadDir {
         ino: Ino,
         fh: Fh,
@@ -61,6 +67,39 @@ pub enum Message {
     ReleaseDir {
         fh: Fh,
         errno: Option<i32>,
+    },
+
+    /// Open a file.
+    Open {
+        errno: Option<i32>,
+        ino: Ino,
+        flags: i32,
+        fh: Fh,
+        open_flags: u32,
+    },
+
+    /// Release a file, called once for each fh
+    Release {
+        errno: Option<i32>,
+        ino: Ino,
+        fh: Fh,
+    },
+
+    /// Read data from
+    Read {
+        errno: Option<i32>,
+        fh: Fh,
+        offset: i64,
+        size: u32,
+        buf: [u8; READ_WRITE_BUFFER_SIZE],
+    },
+
+    Write {
+        errno: Option<i32>,
+        fh: Fh,
+        offset: i64,
+        data: [u8; READ_WRITE_BUFFER_SIZE],
+        written: u32,
     },
 }
 
@@ -161,6 +200,44 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
                 Ok(None) => *finished = true,
                 Err(e) => *errno = Some(e),
             },
+            Message::Open {
+                errno,
+                ino,
+                flags,
+                fh,
+                open_flags,
+            } => match data.open(*ino, *flags) {
+                Ok((file_handle, flags)) => {
+                    *errno = None;
+                    *fh = file_handle;
+                    *open_flags = flags;
+                }
+                Err(e) => *errno = Some(e),
+            },
+
+            Message::Release { errno, ino, fh } => *errno = data.release(*ino, *fh).err(),
+
+            Message::Read {
+                errno,
+                fh,
+                offset,
+                size,
+                buf,
+            } => *errno = data.read(*fh, *offset, *size, buf).err(),
+
+            Message::Write {
+                errno,
+                fh,
+                offset,
+                data: buf,
+                written,
+            } => match data.write(*fh, *offset, &*buf) {
+                Ok(k) => {
+                    *errno = None;
+                    *written = k;
+                }
+                Err(e) => *errno = Some(e),
+            },
         }
         connection.send()?;
     }
@@ -194,10 +271,82 @@ impl LocalData {
             open_files: HashMap::new(),
         }
     }
+
+    fn write(
+        &mut self,
+        fh: u64,
+        offset: i64,
+        data: &[u8; READ_WRITE_BUFFER_SIZE],
+    ) -> Result<u32, i32> {
+        log::info!("Attempting to write to file at handle: {:?}", fh);
+        if let Some(f) = self.open_files.get_mut(&fh) {
+            match f.write(data, offset) {
+                Ok(len) => Ok(len as _),
+                Err(e) => {
+                    log::error!("Failed to wtite bytes: {}", e);
+                    Err(e.raw_os_error().unwrap())
+                }
+            }
+        } else {
+            log::error!(
+                "Failed to write bytes to fh {:?}, could not find open file. There are {} open files.",
+                fh, self.open_files.keys().len()
+            );
+            Err(0)
+        }
+    }
+
+    fn read(
+        &mut self,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        buf: &mut [u8; READ_WRITE_BUFFER_SIZE],
+    ) -> Result<(), i32> {
+        let size = size as usize;
+        assert!(size <= buf.len());
+        if let Some(f) = self.open_files.get_mut(&(fh as _)) {
+            match f.read(&mut *buf, offset) {
+                Ok(bytes_read) => {
+                    log::info!("Read {} bytes into file {}", bytes_read, fh);
+                    Ok(())
+                }
+                Err(e) => Err(e.raw_os_error().unwrap_or(1) as _),
+            }
+        } else {
+            Err(libc::EBADF)
+        }
+    }
+
+    fn release(&mut self, ino: u64, fh: u64) -> Result<(), i32> {
+        log::trace!("Released file {:?} with fh {:?}", self.at_ino(&ino), fh);
+        self.open_files.remove(&fh);
+        Ok(())
+    }
+
+    fn open(&mut self, ino: Ino, flags: i32) -> Result<(Fh, u32), i32> {
+        if let Some(path) = self.at_ino(&ino) {
+            match FileBuilder::from_flags(flags)
+                .read(true)
+                .write(true)
+                .path(path)
+            {
+                Ok(file) => {
+                    let fh = self.register_new_file(file);
+                    Ok((fh as _, flags as _))
+                }
+                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+            }
+        } else {
+            log::error!("Open failed with invalid ino {:?}", ino);
+            Err(libc::EIO)
+        }
+    }
+
     fn readdir(
         &mut self,
-        ino: u64,
-        fh: u64,
+        ino: Ino,
+        fh: Fh,
     ) -> Result<Option<(Ino, i64, FileType, [u8; MAX_FILENAME_LENGTH])>, i32> {
         Errno::clear(); // Because it's not clear if readdir failed from it's output
         let dir_ent = unsafe { libc::readdir(fh as _) };
@@ -285,7 +434,7 @@ impl LocalData {
         }
     }
 
-    fn _register_new_file(&mut self, file: OpenFile) -> Fh {
+    fn register_new_file(&mut self, file: OpenFile) -> Fh {
         let fh = file.fh();
         self.open_files.entry(fh).or_insert(file);
         fh
@@ -541,22 +690,77 @@ impl Filesystem for RDMAFs {
         reply.error(ENOSYS);
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        self.connection[0] = Message::Open {
+            ino,
+            flags,
+            fh: 0,
+            open_flags: 0,
+            errno: None,
+        };
+        self.connection
+            .send()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        self.connection
+            .recv()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        match self.connection[0] {
+            Message::Open {
+                fh,
+                open_flags,
+                errno,
+                ..
+            } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.opened(fh, open_flags);
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected open"),
+        }
     }
 
     fn read(
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _size: u32,
+        fh: u64,
+        offset: i64,
+        size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        reply.error(ENOSYS);
+        self.connection[0] = Message::Read {
+            errno: None,
+            fh,
+            offset,
+            size,
+            buf: [0; READ_WRITE_BUFFER_SIZE],
+        };
+        self.connection
+            .send()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        self.connection
+            .recv()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        match self.connection[0] {
+            Message::Read { errno, buf, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.data(&buf);
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Read"),
+        }
     }
 
     fn write(
@@ -588,14 +792,37 @@ impl Filesystem for RDMAFs {
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        ino: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        self.connection[0] = Message::Release {
+            ino,
+            fh,
+            errno: None,
+        };
+        self.connection
+            .send()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        self.connection
+            .recv()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        match self.connection[0] {
+            Message::Release { errno, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.ok();
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Release"),
+        }
     }
 
     fn fsync(
