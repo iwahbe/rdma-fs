@@ -19,6 +19,24 @@ use std::{
 const MAX_FILENAME_LENGTH: usize = 255;
 const READ_WRITE_BUFFER_SIZE: usize = 4096;
 
+macro_rules! exchange {
+    ($msg: expr, $con: expr) => {
+        $con[0] = $msg;
+        exchange!($con);
+    };
+    ($con: expr) => {
+        $con.send()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+        $con.recv()
+            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+            .unwrap();
+    };
+}
+
+/// The commands that an `RDMAFs` can issue to the server. Each command contains
+/// the information necessary for both a request and a reply. The client loads
+/// the request fields, and gets back a fully filled out reply.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Message {
     Exit,
@@ -99,7 +117,64 @@ pub enum Message {
         fh: Fh,
         offset: i64,
         data: [u8; READ_WRITE_BUFFER_SIZE],
+        /// When a request is made, `written` holds the number of bytes to
+        /// write. A reply contains the number of bytes written.
         written: u32,
+    },
+
+    Flush {
+        errno: Option<i32>,
+        fh: Fh,
+    },
+
+    LSeek {
+        errno: Option<i32>,
+        fh: Fh,
+        offset: i64,
+        whence: i32,
+    },
+
+    Create {
+        errno: Option<i32>,
+        parent: Ino,
+        name: [u8; MAX_FILENAME_LENGTH],
+        flags: i32,
+        //Reply
+        attr: Option<FileAttr>,
+        generation: u64,
+        fh: Fh,
+        open_flags: u32,
+    },
+
+    Mkdir {
+        errno: Option<i32>,
+        parent: Ino,
+        name: [u8; MAX_FILENAME_LENGTH],
+        mode: u32,
+        umask: u32,
+        //Reply
+        attr: Option<FileAttr>,
+        generation: u64,
+    },
+
+    Unlink {
+        errno: Option<i32>,
+        parent: Ino,
+        name: [u8; MAX_FILENAME_LENGTH],
+    },
+
+    Rmdir {
+        errno: Option<i32>,
+        parent: Ino,
+        name: [u8; MAX_FILENAME_LENGTH],
+    },
+
+    Rename {
+        errno: Option<i32>,
+        parent: Ino,
+        name: [u8; MAX_FILENAME_LENGTH],
+        newparent: Ino,
+        newname: [u8; MAX_FILENAME_LENGTH],
     },
 }
 
@@ -180,6 +255,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
                 Err(e) => *errno = Some(e),
             },
             Message::ReleaseDir { fh, errno } => *errno = data.releasedir(*fh).err(),
+
             Message::ReadDir {
                 ino,
                 fh,
@@ -200,6 +276,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
                 Ok(None) => *finished = true,
                 Err(e) => *errno = Some(e),
             },
+
             Message::Open {
                 errno,
                 ino,
@@ -231,13 +308,89 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
                 offset,
                 data: buf,
                 written,
-            } => match data.write(*fh, *offset, &*buf) {
+            } => match data.write(*fh, *offset, &buf[..*written as _]) {
                 Ok(k) => {
                     *errno = None;
                     *written = k;
                 }
                 Err(e) => *errno = Some(e),
             },
+
+            Message::Flush { errno, fh } => *errno = data.flush(*fh).err(),
+
+            Message::LSeek {
+                errno,
+                fh,
+                offset,
+                whence,
+            } => match data.lseek(*fh, *offset, *whence) {
+                Ok(k) => *offset = k,
+                Err(e) => *errno = Some(e),
+            },
+
+            Message::Create {
+                errno,
+                parent,
+                name,
+                flags,
+                attr,
+                generation,
+                fh,
+                open_flags,
+            } => match data.create(*parent, buf_to_osstr(name), *flags) {
+                Ok((f_attr, gen, new_fh, flags)) => {
+                    *attr = Some(f_attr);
+                    *generation = gen;
+                    *fh = new_fh;
+                    *open_flags = flags;
+                }
+                Err(e) => *errno = Some(e),
+            },
+
+            Message::Mkdir {
+                errno,
+                parent,
+                name,
+                mode,
+                umask,
+                attr,
+                generation,
+            } => match data.mkdir(*parent, buf_to_osstr(name), *mode, *umask) {
+                Ok((f_attr, f_gen)) => {
+                    *attr = Some(f_attr);
+                    *generation = f_gen;
+                }
+                Err(e) => *errno = Some(e),
+            },
+
+            Message::Unlink {
+                errno,
+                parent,
+                name,
+            } => *errno = data.unlink(*parent, buf_to_osstr(name)).err(),
+
+            Message::Rmdir {
+                errno,
+                parent,
+                name,
+            } => *errno = data.rmdir(*parent, buf_to_osstr(name)).err(),
+
+            Message::Rename {
+                errno,
+                parent,
+                name,
+                newparent,
+                newname,
+            } => {
+                *errno = data
+                    .rename(
+                        *parent,
+                        buf_to_osstr(name),
+                        *newparent,
+                        buf_to_osstr(newname),
+                    )
+                    .err()
+            }
         }
         connection.send()?;
     }
@@ -258,6 +411,7 @@ pub struct LocalData {
     open_files: HashMap<Fh, OpenFile>,
 }
 
+/// These are the local side operations that correspond to `local.rs`.
 impl LocalData {
     pub fn new(root: PathBuf) -> Self {
         let root = root.canonicalize().unwrap();
@@ -272,12 +426,134 @@ impl LocalData {
         }
     }
 
-    fn write(
+    /// Rename a file.
+    fn rename(
         &mut self,
-        fh: u64,
-        offset: i64,
-        data: &[u8; READ_WRITE_BUFFER_SIZE],
-    ) -> Result<u32, i32> {
+        parent: Ino,
+        name: &OsStr,
+        newparent: Ino,
+        newname: &OsStr,
+    ) -> Result<(), i32> {
+        // TODO: revalidate the [ino <-> path] map
+        let old_name = CString::new(name.as_bytes()).unwrap();
+        let newname = CString::new(newname.as_bytes()).unwrap();
+        let res = unsafe {
+            libc::renameat(
+                parent as _,
+                old_name.as_ptr(),
+                newparent as _,
+                newname.as_ptr(),
+            )
+        };
+        match res {
+            0 => Ok(()),
+            _ => Err(errno()),
+        }
+    }
+
+    /// Remove a directory.
+    fn rmdir(&mut self, parent: Ino, name: &OsStr) -> Result<(), i32> {
+        let path = self.at_ino(&parent).ok_or(libc::ENOENT)?.join(name);
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let res = unsafe { libc::rmdir(path.as_ptr()) };
+        match res {
+            0 => Ok(()),
+            _ => Err(errno()),
+        }
+    }
+
+    /// Remove a file.
+    fn unlink(&mut self, parent: u64, name: &OsStr) -> Result<(), i32> {
+        if let Some(parent) = self.at_ino(&parent) {
+            let fname = CString::new(parent.join(name).as_os_str().as_bytes()).unwrap();
+            let res = unsafe { libc::unlink(fname.as_ptr()) };
+            if res == 0 {
+                Ok(())
+            } else {
+                Err(errno())
+            }
+        } else {
+            log::error!("Unlink failed on invalid parent ino {:?}", parent);
+            Err(libc::ENOENT)
+        }
+    }
+
+    /// Create a directory.
+    fn mkdir(
+        &mut self,
+        parent: Ino,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> Result<(FileAttr, u64), i32> {
+        let res: Result<FileAttr, i32> = try {
+            let name = self.at_ino(&parent).ok_or(libc::ENOENT)?.join(name);
+            let c_name = CString::new(name.as_os_str().as_bytes()).unwrap();
+            // NOTE: unsure about the bit-and
+            let res = unsafe { libc::mkdir(c_name.as_ptr(), (mode & umask) as _) };
+            match res {
+                0 => fs::metadata(&name).as_ref().unwrap().try_into().unwrap(),
+                _ => Err(errno())?,
+            }
+        };
+        res.map(|k| (k, 0))
+    }
+
+    fn create(
+        &mut self,
+        parent: Ino,
+        name: &OsStr,
+        flags: i32,
+    ) -> Result<(FileAttr, u64, Fh, u32), i32> {
+        if let Some(parent) = self.at_ino(&parent) {
+            let path = parent.join(name);
+            log::info!("create called on file {:?}", path);
+            let file = match FileBuilder::from_flags(flags)
+                .create(true)
+                .read(true)
+                .write(true)
+                .path(&path)
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    log::error!("Failed to create file {:?} with error: {}", path, e);
+                    return Err(e.raw_os_error().unwrap());
+                }
+            };
+            let meta = file.metadata().expect("already called, so should work");
+            self.ino_paths.insert(meta.ino(), path);
+            let fd = self.register_new_file(file);
+            Ok(((&meta).into(), 0, fd as _, flags as _))
+        } else {
+            log::error!("Failed to create file {:?} with errno {:?}", name, errno());
+            Err(errno())
+        }
+    }
+
+    /// Reposition read/write file offset
+    fn lseek(&mut self, fh: u64, offset: i64, whence: i32) -> Result<i64, i32> {
+        let offset = unsafe { libc::lseek(fh as _, offset, whence) };
+        if offset == -1 {
+            log::error!("lseek failed with error");
+            Err(errno())
+        } else {
+            Ok(offset)
+        }
+    }
+
+    fn flush(&mut self, fh: Fh) -> Result<(), i32> {
+        if let Some(f) = self.open_files.get_mut(&fh) {
+            if let Some(r) = f.flush().err() {
+                Err(r.raw_os_error().unwrap())
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(libc::ENOENT)
+        }
+    }
+
+    fn write(&mut self, fh: Fh, offset: i64, data: &[u8]) -> Result<u32, i32> {
         log::info!("Attempting to write to file at handle: {:?}", fh);
         if let Some(f) = self.open_files.get_mut(&fh) {
             match f.write(data, offset) {
@@ -376,15 +652,6 @@ impl LocalData {
 
         log::trace!("File {:?} under dir {:?}", file, ino);
 
-        // This conversion is not always necessary on all systems.
-        // The seek data has different names on different OSs
-        #[allow(clippy::useless_conversion)]
-        #[cfg(target_os = "macos")]
-        let seek = dir_ent
-            .d_seekoff
-            .try_into()
-            .expect("File length does not fit into i64");
-        #[cfg(not(target_os = "macos"))]
         let seek = dir_ent.d_off;
 
         self.ino_paths.insert(
@@ -530,21 +797,16 @@ impl Filesystem for RDMAFs {
         assert!(name.len() < MAX_FILENAME_LENGTH);
         let mut buf = [0; MAX_FILENAME_LENGTH];
         &mut buf[..name.len()].copy_from_slice(name);
-        self.connection[0] = Message::Lookup {
-            parent,
-            name: buf,
-            attr: None,
-            generation: 0,
-            errno: None,
-        };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(
+            Message::Lookup {
+                parent,
+                name: buf,
+                attr: None,
+                generation: 0,
+                errno: None,
+            },
+            self.connection
+        );
         match self.connection[0] {
             Message::Lookup {
                 errno,
@@ -568,19 +830,14 @@ impl Filesystem for RDMAFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        self.connection[0] = Message::GetAttr {
-            ino,
-            attr: None,
-            errno: None,
-        };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(
+            Message::GetAttr {
+                ino,
+                attr: None,
+                errno: None,
+            },
+            self.connection
+        );
         match self.connection[0] {
             Message::GetAttr { attr, errno, .. } => {
                 if let Some(errno) = errno {
@@ -622,37 +879,97 @@ impl Filesystem for RDMAFs {
         reply.error(ENOSYS);
     }
 
-    fn mknod(
-        &mut self,
-        _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(ENOSYS);
-    }
-
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(ENOSYS);
+        let mut buf = [0; MAX_FILENAME_LENGTH];
+        buf[0..name.len()].copy_from_slice(name.as_bytes());
+
+        exchange!(
+            Message::Mkdir {
+                errno: None,
+                parent,
+                name: buf,
+                mode,
+                umask,
+                attr: None,
+                generation: 0,
+            },
+            self.connection
+        );
+
+        match self.connection[0] {
+            Message::Mkdir {
+                errno,
+                attr,
+                generation,
+                ..
+            } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.entry(
+                        &std::time::Duration::ZERO,
+                        &attr.expect("File attr info filled"),
+                        generation,
+                    );
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected open"),
+        }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(ENOSYS);
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let mut buf = [0; MAX_FILENAME_LENGTH];
+        buf[0..name.len()].copy_from_slice(name.as_bytes());
+
+        exchange! {
+            Message::Unlink {
+                errno: None,
+                parent,
+                name: buf,
+            },
+            self.connection
+        };
+
+        match self.connection[0] {
+            Message::Unlink { errno, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.ok();
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Unlink"),
+        }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(ENOSYS);
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let mut buf = [0; MAX_FILENAME_LENGTH];
+        buf[0..name.len()].copy_from_slice(name.as_bytes());
+        exchange! {
+            Message::Rmdir {errno: None, parent, name: buf},
+            self.connection
+        };
+        match self.connection[0] {
+            Message::Rmdir { errno, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.ok();
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Rmdir"),
+        }
     }
 
     fn symlink(
@@ -669,14 +986,38 @@ impl Filesystem for RDMAFs {
     fn rename(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
-        _newparent: u64,
-        _newname: &OsStr,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(ENOSYS);
+        let mut buf = [0; MAX_FILENAME_LENGTH];
+        buf[0..name.len()].copy_from_slice(name.as_bytes());
+        let mut newbuf = [0; MAX_FILENAME_LENGTH];
+        newbuf[0..newname.len()].copy_from_slice(newname.as_bytes());
+
+        exchange! {
+            Message::Rename {
+                errno: None,
+                parent,
+                name: buf,
+                newparent,
+                newname: newbuf,
+            }, self.connection
+        };
+        match self.connection[0] {
+            Message::Rmdir { errno, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.ok();
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Rename"),
+        }
     }
 
     fn link(
@@ -691,21 +1032,16 @@ impl Filesystem for RDMAFs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        self.connection[0] = Message::Open {
-            ino,
-            flags,
-            fh: 0,
-            open_flags: 0,
-            errno: None,
-        };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(
+            Message::Open {
+                ino,
+                flags,
+                fh: 0,
+                open_flags: 0,
+                errno: None,
+            },
+            self.connection
+        );
         match self.connection[0] {
             Message::Open {
                 fh,
@@ -735,21 +1071,16 @@ impl Filesystem for RDMAFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        self.connection[0] = Message::Read {
-            errno: None,
-            fh,
-            offset,
-            size,
-            buf: [0; READ_WRITE_BUFFER_SIZE],
-        };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(
+            Message::Read {
+                errno: None,
+                fh,
+                offset,
+                size,
+                buf: [0; READ_WRITE_BUFFER_SIZE],
+            },
+            self.connection
+        );
         match self.connection[0] {
             Message::Read { errno, buf, .. } => {
                 if let Some(errno) = errno {
@@ -767,26 +1098,60 @@ impl Filesystem for RDMAFs {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _data: &[u8],
+        fh: u64,
+        offset: i64,
+        data: &[u8],
         _write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        reply.error(ENOSYS);
+        assert!(data.len() <= READ_WRITE_BUFFER_SIZE);
+        let mut buf = [0; READ_WRITE_BUFFER_SIZE];
+        buf[0..data.len()].copy_from_slice(data);
+        exchange!(
+            Message::Write {
+                errno: None,
+                fh,
+                offset,
+                data: buf,
+                written: data.len() as _,
+            },
+            self.connection
+        );
+        match self.connection[0] {
+            Message::Write { errno, written, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.written(written);
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Write"),
+        }
     }
 
     fn flush(
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
+        fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        reply.error(ENOSYS);
+        exchange!(Message::Flush { errno: None, fh }, self.connection);
+        match self.connection[0] {
+            Message::Flush { errno, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.ok();
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Expected Flush"),
+        }
     }
 
     fn release(
@@ -799,19 +1164,14 @@ impl Filesystem for RDMAFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.connection[0] = Message::Release {
-            ino,
-            fh,
-            errno: None,
-        };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(
+            Message::Release {
+                ino,
+                fh,
+                errno: None,
+            },
+            self.connection
+        );
         match self.connection[0] {
             Message::Release { errno, .. } => {
                 if let Some(errno) = errno {
@@ -825,33 +1185,17 @@ impl Filesystem for RDMAFs {
         }
     }
 
-    fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(ENOSYS);
-    }
-
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        self.connection[0] = Message::OpenDir {
-            ino,
-            flags,
-            fh: 0,
-            open_flags: 0,
-            errno: None,
-        };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(
+            Message::OpenDir {
+                ino,
+                flags,
+                fh: 0,
+                open_flags: 0,
+                errno: None,
+            },
+            self.connection
+        );
         match self.connection[0] {
             Message::OpenDir {
                 fh,
@@ -893,14 +1237,7 @@ impl Filesystem for RDMAFs {
             name: [0; MAX_FILENAME_LENGTH],
         };
         loop {
-            self.connection
-                .send()
-                .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-                .unwrap();
-            self.connection
-                .recv()
-                .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-                .unwrap();
+            exchange!(self.connection);
             match &mut self.connection[0] {
                 Message::Null => {
                     reply.error(ENOSYS);
@@ -933,17 +1270,6 @@ impl Filesystem for RDMAFs {
         reply.ok();
     }
 
-    fn readdirplus(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        reply: ReplyDirectoryPlus,
-    ) {
-        reply.error(ENOSYS);
-    }
-
     fn releasedir(
         &mut self,
         _req: &Request<'_>,
@@ -952,15 +1278,7 @@ impl Filesystem for RDMAFs {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        self.connection[0] = Message::ReleaseDir { errno: None, fh };
-        self.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        self.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+        exchange!(Message::ReleaseDir { errno: None, fh }, self.connection);
         match self.connection[0] {
             Message::Null => reply.error(ENOSYS),
             Message::ReleaseDir { errno, .. } => {
@@ -974,51 +1292,8 @@ impl Filesystem for RDMAFs {
         }
     }
 
-    fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(ENOSYS);
-    }
-
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
-    }
-
-    fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(ENOSYS);
-    }
-
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(ENOSYS);
-    }
-
-    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: ReplyXattr) {
-        reply.error(ENOSYS);
-    }
-
-    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(ENOSYS);
     }
 
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
@@ -1028,111 +1303,83 @@ impl Filesystem for RDMAFs {
     fn create(
         &mut self,
         _req: &Request<'_>,
-        _parent: u64,
-        _name: &OsStr,
+        parent: Ino,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        reply.error(ENOSYS);
-    }
-
-    fn getlk(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
-        _start: u64,
-        _end: u64,
-        _typ: i32,
-        _pid: u32,
-        reply: ReplyLock,
-    ) {
-        reply.error(ENOSYS);
-    }
-
-    fn setlk(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
-        _start: u64,
-        _end: u64,
-        _typ: i32,
-        _pid: u32,
-        _sleep: bool,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(ENOSYS);
-    }
-
-    fn bmap(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _blocksize: u32,
-        _idx: u64,
-        reply: ReplyBmap,
-    ) {
-        reply.error(ENOSYS);
-    }
-
-    fn ioctl(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: u32,
-        _cmd: u32,
-        _in_data: &[u8],
-        _out_size: u32,
-        reply: ReplyIoctl,
-    ) {
-        reply.error(ENOSYS);
-    }
-
-    fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _length: i64,
-        _mode: i32,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(ENOSYS);
+        let mut buf = [0; MAX_FILENAME_LENGTH];
+        buf[0..name.len()].copy_from_slice(name.as_bytes());
+        exchange!(
+            Message::Create {
+                errno: None,
+                parent,
+                name: buf,
+                flags,
+                attr: None,
+                generation: 0,
+                fh: 0,
+                open_flags: 0,
+            },
+            self.connection
+        );
+        match self.connection[0] {
+            Message::Null => reply.error(ENOSYS),
+            Message::Create {
+                errno,
+                attr,
+                generation,
+                fh,
+                open_flags,
+                ..
+            } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.created(
+                        &std::time::Duration::ZERO,
+                        &attr.expect("A filled attribute for create"),
+                        generation,
+                        fh,
+                        open_flags,
+                    );
+                }
+            }
+            _ => panic!("Expected Create"),
+        }
     }
 
     fn lseek(
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _whence: i32,
+        fh: u64,
+        offset: i64,
+        whence: i32,
         reply: ReplyLseek,
     ) {
-        reply.error(ENOSYS);
-    }
-
-    fn copy_file_range(
-        &mut self,
-        _req: &Request<'_>,
-        _ino_in: u64,
-        _fh_in: u64,
-        _offset_in: i64,
-        _ino_out: u64,
-        _fh_out: u64,
-        _offset_out: i64,
-        _len: u64,
-        _flags: u32,
-        reply: ReplyWrite,
-    ) {
-        reply.error(ENOSYS);
+        exchange!(
+            Message::LSeek {
+                errno: None,
+                fh,
+                offset,
+                whence,
+            },
+            self.connection
+        );
+        match self.connection[0] {
+            Message::Null => reply.error(ENOSYS),
+            Message::LSeek { errno, offset, .. } => {
+                if let Some(errno) = errno {
+                    reply.error(errno);
+                } else {
+                    reply.offset(offset);
+                }
+            }
+            _ => panic!("Expected LSeek"),
+        }
     }
 }
 
