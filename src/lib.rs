@@ -8,7 +8,7 @@ mod local;
 mod remote;
 
 pub use local::LocalMount;
-pub use remote::{remote_server, Message, RDMAFs};
+pub use remote::{remote_server, RDMAFs};
 
 use bincode;
 use ibverbs::{CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair};

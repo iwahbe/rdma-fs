@@ -170,6 +170,7 @@ dependencies = [
  "log",
  "page_size",
  "pkg-config",
+ "serde",
  "users",
  "zerocopy",
 ]
@@ -367,7 +368,6 @@ dependencies = [
  "log",
  "memmap2",
  "nix",
- "serde",
 ]
 
 [[package]]

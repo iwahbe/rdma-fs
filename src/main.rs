@@ -67,15 +67,17 @@ fn main() -> io::Result<()> {
                     Arg::with_name("client")
                         .help("Provide the local file system, talking to a remote host to get data")
                         .long("client")
-                        .takes_value(false)
-                        .conflicts_with("host"),
+                        .takes_value(true)
+                        .conflicts_with("host")
+                        .required(true),
                 )
                 .arg(
                     Arg::with_name("host")
                         .help("Provides the remote end of an RDMA file sytem.")
                         .long("host")
                         .takes_value(true)
-                        .conflicts_with("client"),
+                        .conflicts_with("client")
+                        .required(true),
                 )
                 .arg(ip_arg),
         )
@@ -144,8 +146,16 @@ fn main() -> io::Result<()> {
             .value_of_lossy("host")
             .map(|s| PathBuf::from_str(&s).unwrap())
         {
-            let con = std::net::TcpStream::connect(&port)?;
-            let mut con = RDMAConnection::new(1, con)?;
+            let mut con;
+            loop {
+                con = std::net::TcpStream::connect(&port);
+                if con.is_ok() {
+                    break;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+            let mut con = RDMAConnection::new(1, con.unwrap())?;
             remote_server(mountpoint, &mut con)?;
         } else {
             let con = std::net::TcpListener::bind(&port)?.accept()?.0;
@@ -154,10 +164,12 @@ fn main() -> io::Result<()> {
                 .map(|s| PathBuf::from_str(&s).unwrap())
                 .unwrap();
             // We are the client
-            let _backround = spawn_mount(RDMAFs::new(con)?, mountpoint, &[]).unwrap();
+            let con = RDMAFs::new(con)?;
+            let backround = spawn_mount(con, mountpoint, &[]).unwrap();
             let mut s = String::new();
             println!("Return on input");
             stdin().read_line(&mut s).expect("Failed to read input");
+            drop(backround);
         }
     }
     Ok(())

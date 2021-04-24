@@ -428,35 +428,6 @@ impl Filesystem for LocalMount {
         } else {
             reply.error(libc::EBADF)
         }
-        //     let mem = f.memory.as_ref();
-        //     let size = size as usize;
-        //     let remainder = mem.len() - f.seek;
-        //     if size > remainder {
-        //         let mut buf: Vec<u8> = vec![0; size];
-        //         unsafe {
-        //             std::ptr::copy_nonoverlapping(
-        //                 mem.as_ptr().offset(f.seek as _),
-        //                 (&mut buf).as_mut_ptr(),
-        //                 remainder,
-        //             );
-        //         }
-        //         buf[remainder + 1] = libc::EOF as _;
-
-        //         f.seek = mem.len();
-        //     } else {
-        //         reply.data(&mem[f.seek..size]);
-        //         f.seek += size;
-        //     }
-        // }
-        //
-        // Working non-mapped section
-        // let mut buf = vec![0; size as usize];
-        // let bytes_read = unsafe { libc::read(fh as _, buf.as_mut_ptr() as _, size as usize) };
-        // if bytes_read != -1 {
-        //     reply.data(&buf);
-        // } else {
-        //     reply.error(errno());
-        // }
     }
 
     /// Write data.
