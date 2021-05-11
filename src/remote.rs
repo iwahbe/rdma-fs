@@ -1017,7 +1017,7 @@ impl Filesystem for RDMAFs {
             }, self.connection
         };
         match self.connection[0] {
-            Message::Rmdir { errno, .. } => {
+            Message::Rename { errno, .. } => {
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {

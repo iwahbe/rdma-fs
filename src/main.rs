@@ -1,4 +1,4 @@
-use clap::{App, AppSettings, Arg, SubCommand};
+use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use env_logger;
 use fuser::spawn_mount;
 use rdma_fuse::{remote_server, LocalMount, RDMAConnection, RDMAFs};
@@ -28,6 +28,12 @@ fn main() -> io::Result<()> {
                     "Mount a local filesystem, mirroring another point on the current file system",
                 )
                 .arg(
+                    Arg::with_name("rdma")
+                        .takes_value(false)
+                        .help("Even though this is the same system, use rdma anyway")
+                        .long("rdma"),
+                )
+                .arg(
                     Arg::with_name("mount at")
                         .index(1)
                         .required(true)
@@ -38,7 +44,8 @@ fn main() -> io::Result<()> {
                         .index(2)
                         .required(true)
                         .help("The point on the host filesystem to mirror"),
-                ),
+                )
+                .arg(ip_arg.clone()),
         )
         .subcommand(
             SubCommand::with_name("test")
@@ -83,104 +90,51 @@ fn main() -> io::Result<()> {
                 .arg(ip_arg),
         )
         .get_matches();
-    if let Some(matches) = &matches.subcommand_matches("test") {
-        let port = std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT))
-            .unwrap();
-        if matches.is_present("sender") {
-            let mut socket = std::net::TcpStream::connect(&port);
-            while socket.is_err() {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                socket = std::net::TcpStream::connect(&port);
-            }
-            let mut socket = socket.unwrap();
-            let r = test_rdma(true, &mut socket);
-            match &r {
-                Ok(_) => println!("RDMA sent!"),
-                Err(e) => {
-                    println!("Send failed: {}", e);
-                    // Exit will leak memory. This should not matter.
-                    std::process::exit(1)
-                }
-            }
-            return r;
-        } else if matches.is_present("receiver") {
-            let mut socket = std::net::TcpListener::bind(&port)?.accept()?.0;
-            let r = test_rdma(false, &mut socket);
-            match &r {
-                Ok(_) => println!("RDMA received!"),
-                Err(e) => {
-                    println!("Recieve failed: {}", e);
-                    std::process::exit(1)
-                }
-            }
-            return r;
-        } else {
-            let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
-            let sender = std::process::Command::new(std::env::args().next().unwrap())
-                .arg("test")
-                .arg("--sender")
-                .arg("--ip")
-                .arg(port)
-                .spawn()?;
-            let reciever = std::process::Command::new(std::env::args().next().unwrap())
-                .arg("test")
-                .arg("--receiver")
-                .arg("--ip")
-                .arg(port)
-                .spawn()?;
-            let sender = sender.wait_with_output()?;
-            let reciever = reciever.wait_with_output()?;
-            if sender.status.success() && reciever.status.success() {
-                return Ok(());
-            } else {
-                std::process::exit(1);
-            }
-        }
+    if let Some(matches) = matches.subcommand_matches("test") {
+        handle_test(matches)?;
     }
 
-    if let Some(matches) = &matches.subcommand_matches("local") {
+    if let Some(matches) = matches.subcommand_matches("local") {
         let mountpoint = matches
             .value_of("mount at")
             .expect("Clap ensures this is non-empty");
         let mount_reflect = matches.value_of("mount to").expect("Mount failed");
-        let _backround = spawn_mount(LocalMount::new(mount_reflect), &mountpoint, &[]).unwrap();
-        let mut s = String::new();
-        println!("Return on input");
-        stdin().read_line(&mut s).expect("Failed to read input");
-    }
 
-    if let Some(matches) = &matches.subcommand_matches("remote") {
-        let port = std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT))
-            .unwrap();
-        if let Some(mountpoint) = matches
-            .value_of_lossy("host")
-            .map(|s| PathBuf::from_str(&s).unwrap())
-        {
-            let mut con;
-            loop {
-                con = std::net::TcpStream::connect(&port);
-                if con.is_ok() {
-                    break;
-                } else {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-            }
-            let mut con = RDMAConnection::new(1, con.unwrap())?;
-            remote_server(mountpoint, &mut con)?;
+        if matches.is_present("rdma") {
+            let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
+            // We ape a remote rdma process over the default port
+            let mut join = std::process::Command::new(std::env::args().next().unwrap())
+                .arg("remote")
+                .arg("--client")
+                .arg(mountpoint)
+                .arg("--ip")
+                .arg(port)
+                .spawn()?;
+            let res = std::process::Command::new(std::env::args().next().unwrap())
+                .arg("remote")
+                .arg("--host")
+                .arg(mount_reflect)
+                .arg("--ip")
+                .arg(port)
+                .spawn()?
+                .wait()?;
+            let join = join.wait()?;
+            std::process::exit(if join.success() && res.success() {
+                0
+            } else {
+                1
+            });
         } else {
-            let con = std::net::TcpListener::bind(&port)?.accept()?.0;
-            let mountpoint = matches
-                .value_of_lossy("client")
-                .map(|s| PathBuf::from_str(&s).unwrap())
-                .unwrap();
-            // We are the client
-            let con = RDMAFs::new(con)?;
-            let backround = spawn_mount(con, mountpoint, &[]).unwrap();
+            // It's all a local process
+            let _backround = spawn_mount(LocalMount::new(mount_reflect), &mountpoint, &[]).unwrap();
             let mut s = String::new();
             println!("Return on input");
             stdin().read_line(&mut s).expect("Failed to read input");
-            drop(backround);
         }
+    }
+
+    if let Some(matches) = matches.subcommand_matches("remote") {
+        handle_remote(matches)?;
     }
     Ok(())
 }
@@ -197,6 +151,106 @@ fn test_rdma(sender: bool, port: &mut std::net::TcpStream) -> io::Result<()> {
     } else {
         con.recv()?;
         assert_eq!(42, con[0]);
+    }
+    Ok(())
+}
+
+fn handle_test(matches: &ArgMatches) -> io::Result<()> {
+    let port =
+        std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT)).unwrap();
+    if matches.is_present("sender") {
+        let mut socket = std::net::TcpStream::connect(&port);
+        while socket.is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            socket = std::net::TcpStream::connect(&port);
+        }
+        let mut socket = socket.unwrap();
+        let r = test_rdma(true, &mut socket);
+        match &r {
+            Ok(_) => println!("RDMA sent!"),
+            Err(e) => {
+                println!("Send failed: {}", e);
+                // Exit will leak memory. This should not matter.
+                std::process::exit(1)
+            }
+        }
+        return r;
+    } else if matches.is_present("receiver") {
+        let mut socket = std::net::TcpListener::bind(&port)?.accept()?.0;
+        let r = test_rdma(false, &mut socket);
+        match &r {
+            Ok(_) => println!("RDMA received!"),
+            Err(e) => {
+                println!("Recieve failed: {}", e);
+                std::process::exit(1)
+            }
+        }
+        return r;
+    } else {
+        let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
+        let sender = std::process::Command::new(std::env::args().next().unwrap())
+            .arg("test")
+            .arg("--sender")
+            .arg("--ip")
+            .arg(port)
+            .spawn()?;
+        let reciever = std::process::Command::new(std::env::args().next().unwrap())
+            .arg("test")
+            .arg("--receiver")
+            .arg("--ip")
+            .arg(port)
+            .spawn()?;
+        let sender = sender.wait_with_output()?;
+        let reciever = reciever.wait_with_output()?;
+        if sender.status.success() && reciever.status.success() {
+            return Ok(());
+        } else {
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_remote(matches: &ArgMatches) -> io::Result<()> {
+    let port =
+        std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT)).unwrap();
+    if let Some(mountpoint) = matches
+        .value_of_lossy("host")
+        .map(|s| PathBuf::from_str(&s).unwrap())
+    {
+        let mut con;
+        loop {
+            con = std::net::TcpStream::connect(&port);
+            match con {
+                Ok(_) => break,
+                Err(e) => match e.kind() {
+                    io::ErrorKind::ConnectionAborted => {}
+                    io::ErrorKind::AddrInUse => {}
+                    io::ErrorKind::AddrNotAvailable => {}
+                    io::ErrorKind::TimedOut => {
+                        eprintln!("Connection timed out, retrying");
+                    }
+                    _ => {
+                        eprintln!("Failed to connect: {}", e);
+                    }
+                },
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        let mut con = RDMAConnection::new(1, con.unwrap())?;
+        remote_server(mountpoint, &mut con)?;
+    } else {
+        let con = std::net::TcpListener::bind(&port)?.accept()?.0;
+        let mountpoint = matches
+            .value_of_lossy("client")
+            .map(|s| PathBuf::from_str(&s).unwrap())
+            .unwrap();
+        // We are the client
+        let con = RDMAFs::new(con)?;
+        let backround = spawn_mount(con, mountpoint, &[]).unwrap();
+        let mut s = String::new();
+        println!("Return on input");
+        stdin().read_line(&mut s).expect("Failed to read input");
+        drop(backround);
     }
     Ok(())
 }
