@@ -152,14 +152,14 @@ impl OpenFile {
         }
         Ok(())
     }
-    pub fn read(&mut self, buf: &mut [u8], offset: i64) -> io::Result<usize> {
+    pub fn read(&mut self, buf: &mut [u8], offset: i64, size: usize) -> io::Result<usize> {
         let map = self.get_map()?;
         let remainder = if map.len() >= offset as usize {
             map.len() - offset as usize
         } else {
             0
         };
-        let map_size = buf.len().min(remainder);
+        let map_size = buf.len().min(remainder).min(size);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 map.as_ptr().offset(offset as _),

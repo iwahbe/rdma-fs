@@ -394,7 +394,7 @@ impl Filesystem for LocalMount {
         let size = size as usize;
         if let Some(f) = self.open_files.get_mut(&(fh as _)) {
             let mut buf = vec![0; size];
-            match f.read(&mut buf, offset) {
+            match f.read(&mut buf, offset, size) {
                 Ok(bytes_read) => {
                     log::info!("Read {} bytes into file {}", bytes_read, fh);
                     reply.data(&buf);
@@ -581,7 +581,8 @@ impl Filesystem for LocalMount {
                 .to_bytes()
                 .len();
             let file = OsStr::from_bytes(unsafe {
-                &*(&dir_ent.d_name[..file_len] as *const [i8] as *const [u8])
+                // We need to allow an extra step to convert u8 to i8 on some machines
+                &*(&dir_ent.d_name[..file_len] as *const [_] as *const [u8])
             });
             log::trace!("File {:?} under dir {:?}", file, ino);
 

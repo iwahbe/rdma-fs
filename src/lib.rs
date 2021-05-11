@@ -1,6 +1,5 @@
 #![feature(pin_static_ref)]
 #![feature(try_blocks)]
-#![feature(duration_zero)]
 #![feature(option_result_unwrap_unchecked)]
 
 mod file;
@@ -29,6 +28,9 @@ where
 {
     // This is unsafe as f**k
     // We need the fields to drop in this order to avoid ub
+    //
+    // To ensure that our static pointers remain valid, we pin them. This should
+    // prevent the rust runtime from moving them when they mutate themselves.
     mem: MemoryRegion<T>,
     qp: QueuePair<'static>,
     _pd: Pin<Box<ProtectionDomain<'static>>>,
@@ -58,7 +60,8 @@ where
         });
 
         // Unsafe: We cast the lifetime to static. This is safe because we embed
-        // this all in the same struct.
+        // this all in the same struct. The struct garentees the drop order to
+        // be correct.
         let cq: Pin<Box<CompletionQueue<'static>>> =
             Box::pin(unsafe { transmute(ctx.as_ref().create_cq(16, 0)?) });
         let pd: Pin<Box<ProtectionDomain<'static>>> = Box::pin(unsafe {
@@ -100,6 +103,9 @@ where
     pub fn send(&mut self) -> io::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
+        // Unsafe: we perform the unsafe send. This is safe because `self.mem`
+        // is a correctly configured memory region. It is up to the sender to
+        // ensure that recieve is called.
         unsafe { self.qp.post_send(&mut self.mem, .., id) }?;
         self.complete(id)
     }
@@ -108,6 +114,8 @@ where
     pub fn recv(&mut self) -> io::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
+        // Unsafe: It is up the caller to ensure that `complete` is called at
+        // the other end.
         unsafe { self.qp.post_receive(&mut self.mem, .., id) }?;
         self.complete(id)
     }

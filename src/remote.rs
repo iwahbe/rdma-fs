@@ -17,7 +17,7 @@ use std::{
 };
 
 const MAX_FILENAME_LENGTH: usize = 255;
-const READ_WRITE_BUFFER_SIZE: usize = 4096;
+const READ_WRITE_BUFFER_SIZE: usize = 2usize.pow(13);
 
 macro_rules! exchange {
     ($msg: expr, $con: expr) => {
@@ -300,7 +300,10 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
                 offset,
                 size,
                 buf,
-            } => *errno = data.read(*fh, *offset, *size, buf).err(),
+            } => match data.read(*fh, *offset, *size, buf) {
+                Ok(bytes_read) => *size = bytes_read as _,
+                Err(e) => *errno = Some(e),
+            },
 
             Message::Write {
                 errno,
@@ -578,14 +581,19 @@ impl LocalData {
         offset: i64,
         size: u32,
         buf: &mut [u8; READ_WRITE_BUFFER_SIZE],
-    ) -> Result<(), i32> {
+    ) -> Result<usize, i32> {
         let size = size as usize;
         assert!(size <= buf.len());
         if let Some(f) = self.open_files.get_mut(&(fh as _)) {
-            match f.read(&mut *buf, offset) {
+            match f.read(&mut *buf, offset, size) {
                 Ok(bytes_read) => {
-                    log::info!("Read {} bytes into file {}", bytes_read, fh);
-                    Ok(())
+                    log::info!(
+                        "Read {} ({} requested) bytes into file {}",
+                        bytes_read,
+                        size,
+                        fh
+                    );
+                    Ok(bytes_read)
                 }
                 Err(e) => Err(e.raw_os_error().unwrap_or(1) as _),
             }
@@ -647,7 +655,8 @@ impl LocalData {
         let file_len = unsafe { CStr::from_ptr(dir_ent.d_name.as_ptr() as _) }
             .to_bytes()
             .len();
-        let file_buf = unsafe { &*(&dir_ent.d_name[..file_len] as *const [i8] as *const [u8]) };
+        // We need to allow an extra step to convert u8 to i8 on some machines
+        let file_buf = unsafe { &*(&dir_ent.d_name[..file_len] as *const [_] as *const [u8]) };
         let file = buf_to_osstr(file_buf);
 
         log::trace!("File {:?} under dir {:?}", file, ino);
@@ -773,8 +782,8 @@ impl Drop for RDMAFs {
     }
 }
 impl Filesystem for RDMAFs {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
-        // TODO: tune kernal with max read and write
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
+        config.set_max_write(READ_WRITE_BUFFER_SIZE as _).unwrap();
         self.connection
             .recv()
             .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))?;
@@ -1082,11 +1091,13 @@ impl Filesystem for RDMAFs {
             self.connection
         );
         match self.connection[0] {
-            Message::Read { errno, buf, .. } => {
+            Message::Read {
+                errno, buf, size, ..
+            } => {
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
-                    reply.data(&buf);
+                    reply.data(&buf[..size as usize]);
                 }
             }
             Message::Null => reply.error(ENOSYS),

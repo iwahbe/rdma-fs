@@ -1,4 +1,4 @@
-use clap::{App, Arg, SubCommand};
+use clap::{App, AppSettings, Arg, SubCommand};
 use env_logger;
 use fuser::spawn_mount;
 use rdma_fuse::{remote_server, LocalMount, RDMAConnection, RDMAFs};
@@ -21,6 +21,7 @@ fn main() -> io::Result<()> {
     let matches = App::new("Passthrough FS")
         .version("0.1")
         .author("Ian wahbe")
+        .setting(AppSettings::SubcommandRequiredElseHelp)
         .subcommand(
             SubCommand::with_name("local")
                 .about(
@@ -86,8 +87,12 @@ fn main() -> io::Result<()> {
         let port = std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT))
             .unwrap();
         if matches.is_present("sender") {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let mut socket = std::net::TcpStream::connect(&port)?;
+            let mut socket = std::net::TcpStream::connect(&port);
+            while socket.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                socket = std::net::TcpStream::connect(&port);
+            }
+            let mut socket = socket.unwrap();
             let r = test_rdma(true, &mut socket);
             match &r {
                 Ok(_) => println!("RDMA sent!"),
@@ -110,13 +115,18 @@ fn main() -> io::Result<()> {
             }
             return r;
         } else {
+            let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
             let sender = std::process::Command::new(std::env::args().next().unwrap())
                 .arg("test")
                 .arg("--sender")
+                .arg("--ip")
+                .arg(port)
                 .spawn()?;
             let reciever = std::process::Command::new(std::env::args().next().unwrap())
                 .arg("test")
                 .arg("--receiver")
+                .arg("--ip")
+                .arg(port)
                 .spawn()?;
             let sender = sender.wait_with_output()?;
             let reciever = reciever.wait_with_output()?;
