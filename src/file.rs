@@ -69,8 +69,6 @@ impl FileBuilder {
             .write(self.write)
             .create(self.create)
             .open(path)?;
-        // let file = unsafe { fs::File::from_raw_fd(res) };
-
         let meta = file.metadata()?;
         let fh = meta.ino() as _;
         Ok(OpenFile {
@@ -110,11 +108,10 @@ impl OpenFile {
         log::info!("Get map was called on file {:?}", self.fh);
         if self.memory.is_none() {
             let meta = self.file.metadata()?;
+            self.len = meta.len();
+            assert!(meta.len() > 0, "mmaped files must have positive length");
             self.memory = Some(unsafe {
-                match memmap2::MmapOptions::new()
-                    .len(meta.len().max(0) as _)
-                    .map_mut(&self.file)
-                {
+                match memmap2::MmapOptions::new().map_mut(&self.file) {
                     Ok(k) => k,
                     Err(e) => {
                         log::error!(
@@ -128,20 +125,24 @@ impl OpenFile {
                 }
             });
         }
-        Ok(unsafe { self.memory.as_mut().unwrap_unchecked() })
+        Ok(self.memory.as_mut().unwrap())
     }
 
     pub fn write(&mut self, buf: &[u8], offset: i64) -> io::Result<usize> {
-        if buf.len() as u64 + offset as u64 > self.len {
-            self.truncate(buf.len() as u64 + offset as u64)?;
+        if buf.len() == 0 {
+            return Ok(0);
+        }
+        if buf.len() as u64 + offset as u64 >= self.len {
+            self.truncate(buf.len() as u64 + offset as u64 + 1)?;
         }
         let map = self.get_map()?;
+        assert!(
+            map.len() as usize > offset as usize + buf.len(),
+            "We can't write off the end of a file"
+        );
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                map.as_mut_ptr().offset(offset as _),
-                buf.len(),
-            )
+            let map: *mut u8 = map.as_mut_ptr().offset(offset as _);
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), map, buf.len())
         };
         Ok(buf.len())
     }
@@ -153,6 +154,9 @@ impl OpenFile {
         Ok(())
     }
     pub fn read(&mut self, buf: &mut [u8], offset: i64, size: usize) -> io::Result<usize> {
+        if self.len == 0 {
+            return Ok(0);
+        }
         let map = self.get_map()?;
         let remainder = if map.len() >= offset as usize {
             map.len() - offset as usize

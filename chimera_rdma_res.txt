@@ -1,0 +1,43 @@
+## Start Test
+Tue 11 May 2021 10:52:36 PM PDT
+1620798756
+
+## Create files
+
+Total create files: 2283047
+00231c20: No space left on device
+Create files
+
+real    10m8.012s
+user    0m2.352s
+sys     2m25.511s
+
+## tar all
+
+## random access
+Success:        564272
+Fail:   4244
+
+real    1m45.316s
+user    0m1.320s
+sys     0m21.639s
+
+## Random delete and create
+Total create files: 250289
+Total delete files: 250395
+Total error       : 67832
+
+real    1m6.619s
+user    0m0.657s
+sys     0m24.585s
+
+## Remove all files and directories
+
+real    0m18.848s
+user    0m0.440s
+sys     0m17.076s
+
+## Finish test
+1620800366
+Tue 11 May 2021 11:19:26 PM PDT
+TOTAL(seconds): 1610

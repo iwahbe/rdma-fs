@@ -279,6 +279,21 @@ Because this is a modern system, I take advantage of RDMA as my message passing
 interface. This both reduces latency, and the overhead. It does have major
 downsides compared to NFS as well.
 
+##### Running
+To actually use the system, we do the following:
+
+``` sh
+# on the host
+~/x86/bin/rdma-fuse remote --host target/ --ip 192.168.100.1:8393
+# on the client
+~/arm/bin/rdma-fuse remote --client mnt/ --ip 192.168.100.1:8393
+```
+
+This mounts `target` on the host system to the empty folder `mnt` on the client
+system. It uses ip address `192.168.100.1` to communicate with port `8393`.
+Detailed usage information can be found by typing `rdma-fuse help`.
+
+
 
 <!-- Design considerations and choices for your implementation -->
 <!-- Overview of algorithms / code / implementation -->
@@ -290,8 +305,27 @@ downsides compared to NFS as well.
 
 ---
 
+When evaluating the system, we compare it with two other cases. Eitan has
+mirrored the home folder of chimera on `bf1`, so we test that system, the native
+file system. These provide comparison for the RDMA system. I perform the tests
+using the `fs-bench` test provided by
+[ltp](https://github.com/linux-test-project/ltp.git). I have removed the
+ownership components of the test, as my RDMA/FUSE implementation does not
+support ownership.
+
+I ran the test on the all three systems
+
+|                      | chimera       | bf1          | chimera rdma  | chimera bf1 rdma |
+|----------------------|---------------|--------------|---------------|------------------|
+| create files         | 2270277/8m45s | 58123/2m33s  | 2283047/10m8s |                  |
+| random access        | 564363/1m45s  | 10452/0m0.6s | 564272/1m45s  |                  |
+| random create/delete | 250119/1m9s   | 4555/3m2s    | 250289/1m6s   |                  |
+| remove               | 0m19s         | 0m13s        | 0m18s         |                  |
+| total                | 25m24s        | 6m12s        | 26m50s        |                  |
+
+
 <!-- Workloads and environment used for evaluation -->
-<!-- Reproduction instructions -->
+<!-- Reproduction instructions --> 
 <!-- Performance results, as figures or tables -->
 <!-- Comparison to any other known results -->
 

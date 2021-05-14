@@ -1,0 +1,42 @@
+ianwahbe@chimera:~/ltp/testcases/kernel/fs/fs-bench/chimera$ ../fs-bench-test.sh
+## Start Test
+Tue 11 May 2021 06:47:01 PM PDT 
+1620784021
+
+## Create files
+Create files
+
+Total create files: 2270277
+0022e90c: No space left on device
+real    8m45.043s
+user    0m2.259s
+sys     2m20.411s
+
+## tar all
+
+## random access
+Success:        564363
+Fail:   4153
+real    1m45.468s
+user    0m1.324s
+sys     0m21.760s
+
+## Random delete and create
+Total create files: 250119
+Total delete files: 250319
+Total error       : 68078
+
+real    1m8.794s
+user    0m0.593s
+sys     0m26.139s
+                                  
+## Remove all files and directories
+                                 
+real    0m18.877s               
+user    0m0.412s               
+sys     0m17.182s             
+                             
+## Finish test              
+1620785545                 
+Tue 11 May 2021 07:12:25 PM PDT
+TOTAL(seconds): 1524             

@@ -1,0 +1,44 @@
+ianwahbe@bf1:/ltp-arm/testcases/kernel/fs/fs-bench/bf1$ cat ../bf1-res.txt 
+## Start Test
+Wed May 12 02:07:10 UTC 2021
+1620785230
+
+## Create files 
+
+Total create files: 58123
+0000e3ee: No space left on device
+Create files
+
+real    2m33.505s
+user    0m0.396s
+sys     0m41.693s
+
+## tar all 
+
+## random access
+Success:        10452
+Fail:   49
+
+real    0m1.624s
+user    0m0.142s
+sys     0m1.453s
+
+## Random delete and create
+Total create files: 4555
+Total delete files: 4704
+Total error       : 1242
+
+real    3m2.178s
+user    0m0.080s
+sys     0m6.600s
+
+## Remove all files and directories
+
+real    0m12.966s
+user    0m0.134s
+sys     0m11.142s
+
+## Finish test
+1620785602
+Wed May 12 02:13:22 UTC 2021
+TOTAL(seconds): 372

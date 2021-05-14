@@ -2,16 +2,17 @@ use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use env_logger;
 use fuser::spawn_mount;
 use rdma_fuse::{remote_server, LocalMount, RDMAConnection, RDMAFs};
-use std::str::FromStr;
-use std::{io, io::stdin, path::PathBuf};
+use std::{io, io::stdin, net::ToSocketAddrs, path::PathBuf};
+use std::{net::TcpStream, str::FromStr};
 
-const DEFAULT_PORT: &str = "127.0.0.1:8080";
+const DEFAULT_IP: &str = "127.0.0.1:8080";
+const IP_COMMAND: &str = "ip";
 
 fn main() -> io::Result<()> {
     env_logger::init();
-    let ip_arg = Arg::with_name("ip")
+    let ip_arg = Arg::with_name(IP_COMMAND)
         .short("p")
-        .long("ip")
+        .long(IP_COMMAND)
         .takes_value(true)
         .help("What ip (Tcp) address threads will exchange RDMA enpoints over.")
         .validator(|s| match std::net::SocketAddr::from_str(&s) {
@@ -101,7 +102,7 @@ fn main() -> io::Result<()> {
         let mount_reflect = matches.value_of("mount to").expect("Mount failed");
 
         if matches.is_present("rdma") {
-            let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
+            let port = matches.value_of(IP_COMMAND).unwrap_or(DEFAULT_IP);
             // We ape a remote rdma process over the default port
             let mut join = std::process::Command::new(std::env::args().next().unwrap())
                 .arg("remote")
@@ -157,7 +158,7 @@ fn test_rdma(sender: bool, port: &mut std::net::TcpStream) -> io::Result<()> {
 
 fn handle_test(matches: &ArgMatches) -> io::Result<()> {
     let port =
-        std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT)).unwrap();
+        std::net::SocketAddr::from_str(matches.value_of(IP_COMMAND).unwrap_or(DEFAULT_IP)).unwrap();
     if matches.is_present("sender") {
         let mut socket = std::net::TcpStream::connect(&port);
         while socket.is_err() {
@@ -187,7 +188,7 @@ fn handle_test(matches: &ArgMatches) -> io::Result<()> {
         }
         return r;
     } else {
-        let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
+        let port = matches.value_of(IP_COMMAND).unwrap_or(DEFAULT_IP);
         let sender = std::process::Command::new(std::env::args().next().unwrap())
             .arg("test")
             .arg("--sender")
@@ -210,36 +211,47 @@ fn handle_test(matches: &ArgMatches) -> io::Result<()> {
     }
 }
 
+fn connect_port<T>(port: &T) -> io::Result<TcpStream>
+where
+    T: ToSocketAddrs,
+{
+    let mut con;
+    loop {
+        con = std::net::TcpStream::connect(&port);
+        let mut timeout = 2;
+        match con {
+            Ok(_) => break,
+            Err(e) => match e.kind() {
+                io::ErrorKind::TimedOut => {
+                    eprintln!("Connection timed out, retrying");
+                }
+                io::ErrorKind::ConnectionRefused => {
+                    eprintln!("Connection refused: retrying");
+                    timeout = 1;
+                }
+                _ => {
+                    eprintln!("Failed to connect: {}", e);
+                    return Err(e);
+                }
+            },
+        }
+        std::thread::sleep(std::time::Duration::from_secs(timeout));
+    }
+    con
+}
+
 fn handle_remote(matches: &ArgMatches) -> io::Result<()> {
     let port =
-        std::net::SocketAddr::from_str(matches.value_of("port").unwrap_or(DEFAULT_PORT)).unwrap();
+        std::net::SocketAddr::from_str(matches.value_of(IP_COMMAND).unwrap_or(DEFAULT_IP)).unwrap();
     if let Some(mountpoint) = matches
         .value_of_lossy("host")
         .map(|s| PathBuf::from_str(&s).unwrap())
     {
-        let mut con;
-        loop {
-            con = std::net::TcpStream::connect(&port);
-            match con {
-                Ok(_) => break,
-                Err(e) => match e.kind() {
-                    io::ErrorKind::ConnectionAborted => {}
-                    io::ErrorKind::AddrInUse => {}
-                    io::ErrorKind::AddrNotAvailable => {}
-                    io::ErrorKind::TimedOut => {
-                        eprintln!("Connection timed out, retrying");
-                    }
-                    _ => {
-                        eprintln!("Failed to connect: {}", e);
-                    }
-                },
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        let mut con = RDMAConnection::new(1, con.unwrap())?;
+        let con = std::net::TcpListener::bind(&port)?.accept()?.0;
+        let mut con = RDMAConnection::new(1, con)?;
         remote_server(mountpoint, &mut con)?;
     } else {
-        let con = std::net::TcpListener::bind(&port)?.accept()?.0;
+        let con = connect_port(&port)?;
         let mountpoint = matches
             .value_of_lossy("client")
             .map(|s| PathBuf::from_str(&s).unwrap())
