@@ -25,24 +25,25 @@ I build my file system mirror on two new and distinct pieces of technology.
 
 #### FUSE (Filesystem in Userspace) 
 FUSE provides a generic kernel extension, and an interaction library written in
-C (I used a Rust wrapper). Without writing my own kernal extension, this is the
+C (I used a Rust wrapper). Without writing my own kernel extension, this is the
 only way to allow my filesystem to be completely transparent to the user once
 mounted.
 
 #### RDMA (remote direct memory access)
 RDMA provides the low latency communication of data, especially buffer reads and
-writes. I use RDMA's memory region abstraction, which allows the the host and
-accelerator to share (with minimal overhead) a region of memory over the
+writes. I use RDMA's memory region abstraction, which allows the host and
+accelerator to share (with minimal overhead) a region of memory over a local
 network. This has the advantage of not requiring a system call to exchange
 information. Instead, RDMA uses a queue system. Each call to send the memory
 region is deposited in a device specific queue, and eventually sent by the OS.
-Likewise, we receive from looking at a queue maintained by the OS (holding
+Likewise, we receive message by looking at a queue maintained by the OS (holding
 incoming memory writes). To read or write data from the memory region, you can
-just dereference the pointer to it, and pretend its backed by normal memory. I
-found some similarity between RDMA and working with memory mapped files.
+just dereference the pointer to it, and treat the memory region as an allocated
+array. I found some similarity between RDMA and
+working with memory mapped files.
 
 Because RDMA does not use the standard network abstractions, it requires special
-hardware and software to use. I run RDMA over a 25g cable between our Nvidia
+hardware and software to use. I run RDMA over a 25 GB cable between our Nvidia
 Bluefield network card and the host machine (chimera), with both running linux.
 It requires configuration of the devices at both ends, as well as a kernel
 extension to handle the queues.
@@ -91,7 +92,7 @@ like this:
 
 ---
 
-I needed to pair this with a RDMA library. I chose
+I needed to pair this with an RDMA library. I chose
 [ibverbs](https://github.com/jonhoo/rust-ibverbs). It provided a solid set of
 abstractions for RDMA, but usage details are too complicated to go into here.
 Most of the finicky RDMA work was done in `rdma-fuse/src/lib.rs`, and is
@@ -104,11 +105,11 @@ proceeded to fill in the methods as required.
 
 Given FUSE, the main design followed. I built a server that sat on the host
 (chimera), and a client that runs on the accelerator. They begin by generating a
-TCP connection, which is used to initiate a RDMA handshake. After that, all
+TCP connection, which is used to initiate an RDMA handshake. After that, all
 communication occurs by reading and writing to the fixed size buffer. We store a
 fixed size `enum` (tagged union), and read the tag to determine which operation
 is requested. Each payload contains the information for both a request and a
-reply, allowing the client to validate it's reply and allowing the server to
+reply, allowing the client to validate its reply and allowing the server to
 perform minimal writes to shared memory. Each message corresponds to a file
 system syscall, and thus a FUSE request (except `Exit` and `Null`). When
 received by the server, it responds with an associated method on the `LocalData`
@@ -269,17 +270,17 @@ We can describe the system as follows:
 ```
 
 Only the host side stores state. The client only remembers what type of call it
-is currently executing, and that is maintained by program staci.
+is currently executing, and that is maintained by program stack.
 
 
 #### Similar Systems
 
-This sounds a lot like NFS, but is importantly different. Because the goal is
-for computers who are write next to each other to communicate, instead of a
-generic and fallable 1-N pairing, I can operate much more efficiently then NFS.
-Because this is a modern system, I take advantage of RDMA as my message passing
-interface. This both reduces latency, and the overhead. It does have major
-downsides compared to NFS as well.
+This sounds a lot like NFS, but is importantly different. Because the goal is to
+facilitate communication for computers which are directly adjacent (or attached)
+to each other, instead of a generic and fallable 1-N pairing, I can operate much
+more efficiently then NFS. Because this is a modern system, I take advantage of
+RDMA as my message passing interface. This both reduces latency, and the
+overhead. It does have major downsides compared to NFS as well.
 
 ##### Running
 To actually use the system, we do the following:
@@ -314,7 +315,7 @@ using the `fs-bench` test provided by
 [ltp](https://github.com/linux-test-project/ltp.git). I have removed the
 ownership components of the test, as my RDMA/FUSE implementation does not
 support ownership. The linux test project contains instructions to build and run
-it's tests. `fs-bench` is in `testcases/kernel/fs`, and contains its own
+its tests. `fs-bench` is in `testcases/kernel/fs`, and contains its own
 instructions.
 
 `fs-bench` has four phases:
@@ -353,7 +354,7 @@ I draw 2 conclusions from this data.
    latency from the system itself, not from data transfer.
 2. There is a 90% increase cost from transferring the data back and forth
    between host and client. A rough doubling makes sense. Data needs to be moved
-   from the input buffer (managed by FUSE), to a RDMA buffer. It is then sent to
+   from the input buffer (managed by FUSE), to an RDMA buffer. It is then sent to
    the host computer, copied into a memory mapped file, and a confirmation is
    sent back. This means that any read and write must occur twice.
 
@@ -370,8 +371,8 @@ I draw 2 conclusions from this data.
 ---
 
 I successfully implemented a file system mirroring system that operates over
-RDMA. It is incomparably fast verses to NFS. I measured the results, and provide
-a replicable test. While the system solid, it could be further optimized. Every
+RDMA. It is incomparably fast versus NFS. I measured the results, and provide a
+replicable test. While the system is solid, it could be further optimized. Every
 RDMA communication exchanges a full buffer of size `READ_WRITE_BUFFER_SIZE`
 (8192). I would like to extend the system, to only exchange the necessary amount
 of space. There are also missing capabilities, like permissions and soft links.
