@@ -1,7 +1,12 @@
-## RDMA Filesystem Over FUSE
+## FUSE Filesystem Over RDMA
 Completed for Reed's Topics in Systems class. Professor is [Eitan Frachtenberg](https://www.reed.edu/faculty-profiles/profiles/frachtenberg-eitan.html).  
 
 Ian Wahbe
+
+### Building
+
+The program should compile fine with `cargo build`. It does need rust's nightly
+compiler.
 
 ### Background <!-- (1-2 pages) -->
 
