@@ -1,4 +1,6 @@
 ## RDMA Filesystem Over FUSE
+Completed for Reed's Topics in Systems class. Professor is [Eitan Frachtenberg](https://www.reed.edu/faculty-profiles/profiles/frachtenberg-eitan.html).  
+
 Ian Wahbe
 
 ### Background <!-- (1--2 pages) -->
@@ -311,17 +313,51 @@ file system. These provide comparison for the RDMA system. I perform the tests
 using the `fs-bench` test provided by
 [ltp](https://github.com/linux-test-project/ltp.git). I have removed the
 ownership components of the test, as my RDMA/FUSE implementation does not
-support ownership.
+support ownership. The linux test project contains instructions to build and run
+it's tests. `fs-bench` is in `testcases/kernel/fs`, and contains its own
+instructions.
 
-I ran the test on the all three systems
+`fs-bench` has four phases:
 
-|                      | chimera       | bf1          | chimera rdma  | chimera bf1 rdma |
-|----------------------|---------------|--------------|---------------|------------------|
-| create files         | 2270277/8m45s | 58123/2m33s  | 2283047/10m8s |                  |
-| random access        | 564363/1m45s  | 10452/0m0.6s | 564272/1m45s  |                  |
-| random create/delete | 250119/1m9s   | 4555/3m2s    | 250289/1m6s   |                  |
-| remove               | 0m19s         | 0m13s        | 0m18s         |                  |
-| total                | 25m24s        | 6m12s        | 26m50s        |                  |
+1. It creates files until the file system is out of memory.
+2. It randomly accesses the files it creates.
+3. It deletes and creates randomly.
+4. It deletes all files it created. 
+
+I modified the default test, removing changing the file owners between stages.
+My implementation does not support changing ownership of files. Running a
+benchmark is done simply with a command like this one:
+
+``` sh
+ianwahbe@bf1:/ltp-arm/testcases/kernel/fs/fs-bench/mnt$ ../fs-benchmark.sh |& tee ../result.txt
+```
+
+I ran the test on the all three systems, as well as an internal chimera with rdma. 
+
+|                      | chimera       | chimera rdma         | bf1          | chimera bf1 rdma     |
+|----------------------|---------------|----------------------|--------------|----------------------|
+| technology           | native fs     | rdma (same computer) | native fs    | rdma (bf1 - chimera) |
+| create files         | 2270277/8m45s | 2283047/10m8s        | 58123/2m33s  | 57420/4m49s          |
+| random access        | 564363/1m45s  | 564272/1m45s         | 10452/0m0.6s | 10459/0m8s           |
+| random create/delete | 250119/1m9s   | 250289/1m6s          | 4555/3m2s    | 4523/0m29s           |
+| remove               | 0m19s         | 0m18s                | 0m13s        | 0m11s                |
+| total                | 25m24s        | 26m50s               | 6m12s        | 10m38s               |
+
+I also attempted to run `fs-bench` over `NFS` as it was already installed. After
+an hour, NFS failed, and the benchmark started returning errors.
+
+I draw 2 conclusions from this data.
+
+1. That FUSE and RDMA impose a roughly 10% cost over directly using the build in
+   file system. We see this from comparing `chimera` and `chimera rdma`. This is
+   latency from the system itself, not from data transfer.
+2. There is a 90% increase cost from transferring the data back and forth
+   between host and client. A rough doubling makes sense. Data needs to be moved
+   from the input buffer (managed by FUSE), to a RDMA buffer. It is then sent to
+   the host computer, copied into a memory mapped file, and a confirmation is
+   sent back. This means that any read and write must occur twice.
+
+
 
 
 <!-- Workloads and environment used for evaluation -->
@@ -333,6 +369,13 @@ I ran the test on the all three systems
 
 ---
 
-<!-- Summary of findings and experience working on this project -->
+I successfully implemented a file system mirroring system that operates over
+RDMA. It is incomparably fast verses to NFS. I measured the results, and provide
+a replicable test. While the system solid, it could be further optimized. Every
+RDMA communication exchanges a full buffer of size `READ_WRITE_BUFFER_SIZE`
+(8192). I would like to extend the system, to only exchange the necessary amount
+of space. There are also missing capabilities, like permissions and soft links.
+
+<!-- Summary of findings and experience working on this project --> 
 <!-- Future work and “wish list” items -->
 
