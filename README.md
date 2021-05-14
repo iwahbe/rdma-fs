@@ -3,7 +3,7 @@ Completed for Reed's Topics in Systems class. Professor is [Eitan Frachtenberg](
 
 Ian Wahbe
 
-### Background <!-- (1--2 pages) -->
+### Background <!-- (1-2 pages) -->
 
 --- 
 
