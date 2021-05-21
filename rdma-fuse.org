@@ -21,3 +21,25 @@ ip not configured
 - ib_test_write
 - ib_test_read
 - ib_* for all tests
+
+* [1/3] Converting to efficient transmission
+In an effort to cut down the penalty for sending a full buffer for every action,
+we move the previous enum into a manually handled tagged union. We then can send
+only the correct amount of data with each RDMA send verb.
+** [2/2] Convert =enum= to tagged union
+*** DONE Convert
+*** DONE Test
+** [1/2] Convert =RDMAConnection= to use multiple =u8= instead of a single =(Message, MessagePayload)=
+*** DONE Convert
+*** TODO Test
+** [0/2] Send only the correct amount
+*** TODO Convert
+*** TODO Test
+
+* [0/2] Buffer Reads and Writes
+Currently reads and writes all =send= verbs to fixed size buffer. If the
+required send is too large, the program crashes. If it is too small, we send an
+overlarge amount of data. We should instead send only some fixed amount per
+=send=, and repeat sends as needed until the message is received.
+** TODO Implement
+** TODO Test

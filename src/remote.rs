@@ -9,8 +9,7 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     ffi::{CStr, CString, OsStr},
-    fs,
-    io::{self, Read, Write},
+    fs, io,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::PathBuf,
     sync::atomic::AtomicBool,
@@ -19,19 +18,199 @@ use std::{
 const MAX_FILENAME_LENGTH: usize = 255;
 const READ_WRITE_BUFFER_SIZE: usize = 2usize.pow(13);
 
+pub const RDMA_MESSAGE_BUFFER_SIZE: usize = std::mem::size_of::<(Message, MessagePayload)>();
+
 macro_rules! exchange {
+    ($msg: expr, $name: ident, $load: expr, $con: expr) => {
+        *$con.tag() = $msg;
+        $con.payload().$name = $load;
+        exchange!($con);
+    };
     ($msg: expr, $con: expr) => {
-        $con[0] = $msg;
+        $con[0].0 = $msg;
         exchange!($con);
     };
     ($con: expr) => {
-        $con.send()
+        $con.connection
+            .send()
             .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
             .unwrap();
-        $con.recv()
+        $con.connection
+            .recv()
             .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
             .unwrap();
     };
+}
+#[derive(Clone, Copy, PartialEq)]
+struct GetAttr {
+    errno: Option<i32>,
+    ino: Ino,
+    attr: Option<FileAttr>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Lookup {
+    pub errno: Option<i32>,
+    pub parent: Ino,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+    pub attr: Option<FileAttr>,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Startup {
+    pub server: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct OpenDir {
+    pub errno: Option<i32>,
+    pub ino: Ino,
+    pub flags: i32,
+    pub fh: Fh,
+    pub open_flags: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct ReadDir {
+    pub ino: Ino,
+    pub fh: Fh,
+    pub finished: bool,
+    pub errno: Option<i32>,
+    pub buf_ino: Ino,
+    pub offset: i64,
+    pub kind: FileType,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct ReleaseDir {
+    pub fh: Fh,
+    pub errno: Option<i32>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Open {
+    pub errno: Option<i32>,
+    pub ino: Ino,
+    pub flags: i32,
+    pub fh: Fh,
+    pub open_flags: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Release {
+    pub errno: Option<i32>,
+    pub ino: Ino,
+    pub fh: Fh,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Flush {
+    pub errno: Option<i32>,
+    pub fh: Fh,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct LSeek {
+    pub errno: Option<i32>,
+    pub fh: Fh,
+    pub offset: i64,
+    pub whence: i32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Create {
+    pub errno: Option<i32>,
+    pub parent: Ino,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+    pub flags: i32,
+    pub attr: Option<FileAttr>,
+    pub generation: u64,
+    pub fh: Fh,
+    pub open_flags: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Mkdir {
+    pub errno: Option<i32>,
+    pub parent: Ino,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+    pub mode: u32,
+    pub umask: u32,
+    pub attr: Option<FileAttr>,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Unlink {
+    pub errno: Option<i32>,
+    pub parent: Ino,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Rmdir {
+    pub errno: Option<i32>,
+    pub parent: Ino,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Rename {
+    pub errno: Option<i32>,
+    pub parent: Ino,
+    pub name: [u8; MAX_FILENAME_LENGTH],
+    pub newparent: Ino,
+    pub newname: [u8; MAX_FILENAME_LENGTH],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Read {
+    pub errno: Option<i32>,
+    pub fh: Fh,
+    pub offset: i64,
+    pub size: u32,
+    pub buf: [u8; READ_WRITE_BUFFER_SIZE],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Write {
+    pub errno: Option<i32>,
+    pub fh: Fh,
+    pub offset: i64,
+    pub data: [u8; READ_WRITE_BUFFER_SIZE],
+    /// When a request is made, `written` holds the number of bytes to
+    /// write. A reply contains the number of bytes written.
+    pub written: u32,
+}
+
+#[derive(Clone, Copy)]
+pub union MessagePayload {
+    startup: Startup,
+    lookup: Lookup,
+    get_attr: GetAttr,
+    open_dir: OpenDir,
+    read_dir: ReadDir,
+    release_dir: ReleaseDir,
+    open: Open,
+    release: Release,
+    read: Read,
+    write: Write,
+    flush: Flush,
+    l_seek: LSeek,
+    create: Create,
+    mkdir: Mkdir,
+    unlink: Unlink,
+    rmdir: Rmdir,
+    rename: Rename,
+    null: (),
+}
+
+impl Default for MessagePayload {
+    fn default() -> Self {
+        Self { null: () }
+    }
 }
 
 /// The commands that an `RDMAFs` can issue to the server. Each command contains
@@ -39,143 +218,25 @@ macro_rules! exchange {
 /// the request fields, and gets back a fully filled out reply.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Message {
+    Null = 0,
     Exit,
-
-    Startup {
-        server: bool,
-    },
-
-    Null,
-
-    Lookup {
-        errno: Option<i32>,
-        parent: Ino,
-        name: [u8; MAX_FILENAME_LENGTH],
-        attr: Option<FileAttr>, //to allow default
-        generation: u64,
-    },
-
-    GetAttr {
-        errno: Option<i32>,
-        ino: Ino,
-        attr: Option<FileAttr>,
-    },
-
-    OpenDir {
-        errno: Option<i32>,
-        ino: Ino,
-        flags: i32,
-        fh: Fh,
-        open_flags: u32,
-    },
-
-    ReadDir {
-        ino: Ino,
-        fh: Fh,
-
-        // For buffered comminication
-        finished: bool,
-        errno: Option<i32>,
-        buf_ino: Ino,
-        offset: i64,
-        kind: FileType,
-        name: [u8; MAX_FILENAME_LENGTH],
-    },
-
-    ReleaseDir {
-        fh: Fh,
-        errno: Option<i32>,
-    },
-
-    /// Open a file.
-    Open {
-        errno: Option<i32>,
-        ino: Ino,
-        flags: i32,
-        fh: Fh,
-        open_flags: u32,
-    },
-
-    /// Release a file, called once for each fh
-    Release {
-        errno: Option<i32>,
-        ino: Ino,
-        fh: Fh,
-    },
-
-    /// Read data from
-    Read {
-        errno: Option<i32>,
-        fh: Fh,
-        offset: i64,
-        size: u32,
-        buf: [u8; READ_WRITE_BUFFER_SIZE],
-    },
-
-    Write {
-        errno: Option<i32>,
-        fh: Fh,
-        offset: i64,
-        data: [u8; READ_WRITE_BUFFER_SIZE],
-        /// When a request is made, `written` holds the number of bytes to
-        /// write. A reply contains the number of bytes written.
-        written: u32,
-    },
-
-    Flush {
-        errno: Option<i32>,
-        fh: Fh,
-    },
-
-    LSeek {
-        errno: Option<i32>,
-        fh: Fh,
-        offset: i64,
-        whence: i32,
-    },
-
-    Create {
-        errno: Option<i32>,
-        parent: Ino,
-        name: [u8; MAX_FILENAME_LENGTH],
-        flags: i32,
-        //Reply
-        attr: Option<FileAttr>,
-        generation: u64,
-        fh: Fh,
-        open_flags: u32,
-    },
-
-    Mkdir {
-        errno: Option<i32>,
-        parent: Ino,
-        name: [u8; MAX_FILENAME_LENGTH],
-        mode: u32,
-        umask: u32,
-        //Reply
-        attr: Option<FileAttr>,
-        generation: u64,
-    },
-
-    Unlink {
-        errno: Option<i32>,
-        parent: Ino,
-        name: [u8; MAX_FILENAME_LENGTH],
-    },
-
-    Rmdir {
-        errno: Option<i32>,
-        parent: Ino,
-        name: [u8; MAX_FILENAME_LENGTH],
-    },
-
-    Rename {
-        errno: Option<i32>,
-        parent: Ino,
-        name: [u8; MAX_FILENAME_LENGTH],
-        newparent: Ino,
-        newname: [u8; MAX_FILENAME_LENGTH],
-    },
+    Startup,
+    Lookup,
+    GetAttr,
+    OpenDir,
+    ReadDir,
+    ReleaseDir,
+    Open,
+    Release,
+    Read,
+    Write,
+    Flush,
+    LSeek,
+    Create,
+    Mkdir,
+    Unlink,
+    Rmdir,
+    Rename,
 }
 
 impl Default for Message {
@@ -187,12 +248,25 @@ impl Default for Message {
 pub(crate) static EXIT: AtomicBool = AtomicBool::new(false);
 
 /// A blocking call to the main event loop of the RDMA server.
-pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) -> io::Result<()> {
-    connection[0] = Message::Startup { server: true };
+pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::Result<()> {
+    assert_eq!(
+        connection.len(),
+        RDMA_MESSAGE_BUFFER_SIZE,
+        "We need a correctly sized RDMA buffer"
+    );
+    let (tag, payload): &mut (Message, MessagePayload) =
+        unsafe { &mut *(connection.as_mut_ptr() as *mut (Message, MessagePayload)) };
+    *tag = Message::Startup;
+    payload.startup = Startup { server: true };
     connection.send().unwrap();
     connection.recv().unwrap();
     assert!(
-        Message::Startup { server: false } == connection[0],
+        Message::Startup == *tag,
+        "Failed startup handshake (server)"
+    );
+
+    assert!(
+        Startup { server: false } == unsafe { payload.startup },
         "Failed startup handshake (server)"
     );
     println!("Handshake with the server completed");
@@ -201,190 +275,238 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
     loop {
         if EXIT.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("Exiting server");
-            connection[0] = Message::Exit;
+            *tag = Message::Exit;
             connection.send().unwrap();
             return Ok(());
         }
 
         connection.recv()?;
 
-        match &mut connection[0] {
+        match tag {
             Message::Exit => {
                 println!("Recieved exit command. Goodbye!");
                 return Ok(());
             }
-            Message::Startup { server: _ } => {
+            Message::Startup => {
+                unsafe { assert!(!payload.startup.server) };
                 println!("Recieved unexpected startup command.");
             }
             Message::Null => {}
-            Message::Lookup {
-                parent,
-                name,
-                attr,
-                generation,
-                errno,
-            } => match data.lookup(*parent, name) {
-                Ok((fattr, gen)) => {
-                    *attr = Some(fattr);
-                    *generation = gen;
+            Message::Lookup => {
+                let Lookup {
+                    parent,
+                    name,
+                    attr,
+                    generation,
+                    errno,
+                } = unsafe { &mut payload.lookup };
+                match data.lookup(*parent, name) {
+                    Ok((fattr, gen)) => {
+                        *attr = Some(fattr);
+                        *generation = gen;
+                    }
+                    Err(e) => *errno = Some(e),
                 }
-                Err(e) => *errno = Some(e),
-            },
-            Message::GetAttr { errno, ino, attr } => match data.getattr(*ino) {
-                Ok(k) => {
-                    *attr = Some(k);
-                    *errno = None;
+            }
+            Message::GetAttr => {
+                let GetAttr { errno, ino, attr } = unsafe { &mut payload.get_attr };
+                match data.getattr(*ino) {
+                    Ok(k) => {
+                        *attr = Some(k);
+                        *errno = None;
+                    }
+                    Err(e) => {
+                        *errno = Some(e);
+                        *attr = None;
+                    }
                 }
-                Err(e) => {
-                    *errno = Some(e);
-                    *attr = None;
+            }
+            Message::OpenDir => {
+                let OpenDir {
+                    ino,
+                    flags,
+                    fh,
+                    open_flags,
+                    errno,
+                } = unsafe { &mut payload.open_dir };
+                match data.opendir(*ino, *flags) {
+                    Ok((file_handle, flags)) => {
+                        *open_flags = flags;
+                        *fh = file_handle;
+                        *errno = None;
+                    }
+                    Err(e) => *errno = Some(e),
                 }
-            },
-            Message::OpenDir {
-                ino,
-                flags,
-                fh,
-                open_flags,
-                errno,
-            } => match data.opendir(*ino, *flags) {
-                Ok((file_handle, flags)) => {
-                    *open_flags = flags;
-                    *fh = file_handle;
-                    *errno = None;
+            }
+            Message::ReleaseDir => {
+                let ReleaseDir { fh, errno } = unsafe { &mut payload.release_dir };
+                *errno = data.releasedir(*fh).err()
+            }
+
+            Message::ReadDir => {
+                let ReadDir {
+                    ino,
+                    fh,
+                    errno,
+                    buf_ino,
+                    offset,
+                    kind,
+                    name,
+                    finished,
+                } = unsafe { &mut payload.read_dir };
+                match data.readdir(*ino, *fh) {
+                    Ok(Some((r_ino, r_offset, r_kind, r_name))) => {
+                        *errno = None;
+                        *buf_ino = r_ino;
+                        *offset = r_offset;
+                        *kind = r_kind;
+                        *name = r_name;
+                    }
+                    Ok(None) => *finished = true,
+                    Err(e) => *errno = Some(e),
                 }
-                Err(e) => *errno = Some(e),
-            },
-            Message::ReleaseDir { fh, errno } => *errno = data.releasedir(*fh).err(),
+            }
 
-            Message::ReadDir {
-                ino,
-                fh,
-                errno,
-                buf_ino,
-                offset,
-                kind,
-                name,
-                finished,
-            } => match data.readdir(*ino, *fh) {
-                Ok(Some((r_ino, r_offset, r_kind, r_name))) => {
-                    *errno = None;
-                    *buf_ino = r_ino;
-                    *offset = r_offset;
-                    *kind = r_kind;
-                    *name = r_name;
+            Message::Open => {
+                let Open {
+                    errno,
+                    ino,
+                    flags,
+                    fh,
+                    open_flags,
+                } = unsafe { &mut payload.open };
+                match data.open(*ino, *flags) {
+                    Ok((file_handle, flags)) => {
+                        *errno = None;
+                        *fh = file_handle;
+                        *open_flags = flags;
+                    }
+                    Err(e) => *errno = Some(e),
                 }
-                Ok(None) => *finished = true,
-                Err(e) => *errno = Some(e),
-            },
+            }
 
-            Message::Open {
-                errno,
-                ino,
-                flags,
-                fh,
-                open_flags,
-            } => match data.open(*ino, *flags) {
-                Ok((file_handle, flags)) => {
-                    *errno = None;
-                    *fh = file_handle;
-                    *open_flags = flags;
+            Message::Release => {
+                let Release { errno, ino, fh } = unsafe { &mut payload.release };
+                *errno = data.release(*ino, *fh).err()
+            }
+
+            Message::Read => {
+                let Read {
+                    errno,
+                    fh,
+                    offset,
+                    size,
+                    buf,
+                } = unsafe { &mut payload.read };
+                match data.read(*fh, *offset, *size, buf) {
+                    Ok(bytes_read) => *size = bytes_read as _,
+                    Err(e) => *errno = Some(e),
                 }
-                Err(e) => *errno = Some(e),
-            },
+            }
 
-            Message::Release { errno, ino, fh } => *errno = data.release(*ino, *fh).err(),
-
-            Message::Read {
-                errno,
-                fh,
-                offset,
-                size,
-                buf,
-            } => match data.read(*fh, *offset, *size, buf) {
-                Ok(bytes_read) => *size = bytes_read as _,
-                Err(e) => *errno = Some(e),
-            },
-
-            Message::Write {
-                errno,
-                fh,
-                offset,
-                data: buf,
-                written,
-            } => match data.write(*fh, *offset, &buf[..*written as _]) {
-                Ok(k) => {
-                    *errno = None;
-                    *written = k;
+            Message::Write => {
+                let Write {
+                    errno,
+                    fh,
+                    offset,
+                    data: buf,
+                    written,
+                } = unsafe { &mut payload.write };
+                match data.write(*fh, *offset, &buf[..*written as _]) {
+                    Ok(k) => {
+                        *errno = None;
+                        *written = k;
+                    }
+                    Err(e) => *errno = Some(e),
                 }
-                Err(e) => *errno = Some(e),
-            },
+            }
 
-            Message::Flush { errno, fh } => *errno = data.flush(*fh).err(),
+            Message::Flush => {
+                let Flush { errno, fh } = unsafe { &mut payload.flush };
+                *errno = data.flush(*fh).err()
+            }
 
-            Message::LSeek {
-                errno,
-                fh,
-                offset,
-                whence,
-            } => match data.lseek(*fh, *offset, *whence) {
-                Ok(k) => *offset = k,
-                Err(e) => *errno = Some(e),
-            },
-
-            Message::Create {
-                errno,
-                parent,
-                name,
-                flags,
-                attr,
-                generation,
-                fh,
-                open_flags,
-            } => match data.create(*parent, buf_to_osstr(name), *flags) {
-                Ok((f_attr, gen, new_fh, flags)) => {
-                    *attr = Some(f_attr);
-                    *generation = gen;
-                    *fh = new_fh;
-                    *open_flags = flags;
+            Message::LSeek => {
+                let LSeek {
+                    errno,
+                    fh,
+                    offset,
+                    whence,
+                } = unsafe { &mut payload.l_seek };
+                match data.lseek(*fh, *offset, *whence) {
+                    Ok(k) => *offset = k,
+                    Err(e) => *errno = Some(e),
                 }
-                Err(e) => *errno = Some(e),
-            },
+            }
 
-            Message::Mkdir {
-                errno,
-                parent,
-                name,
-                mode,
-                umask,
-                attr,
-                generation,
-            } => match data.mkdir(*parent, buf_to_osstr(name), *mode, *umask) {
-                Ok((f_attr, f_gen)) => {
-                    *attr = Some(f_attr);
-                    *generation = f_gen;
+            Message::Create => {
+                let Create {
+                    errno,
+                    parent,
+                    name,
+                    flags,
+                    attr,
+                    generation,
+                    fh,
+                    open_flags,
+                } = unsafe { &mut payload.create };
+
+                match data.create(*parent, buf_to_osstr(name), *flags) {
+                    Ok((f_attr, gen, new_fh, flags)) => {
+                        *attr = Some(f_attr);
+                        *generation = gen;
+                        *fh = new_fh;
+                        *open_flags = flags;
+                    }
+                    Err(e) => *errno = Some(e),
                 }
-                Err(e) => *errno = Some(e),
-            },
+            }
 
-            Message::Unlink {
-                errno,
-                parent,
-                name,
-            } => *errno = data.unlink(*parent, buf_to_osstr(name)).err(),
+            Message::Mkdir => {
+                let Mkdir {
+                    errno,
+                    parent,
+                    name,
+                    mode,
+                    umask,
+                    attr,
+                    generation,
+                } = unsafe { &mut payload.mkdir };
+                match data.mkdir(*parent, buf_to_osstr(name), *mode, *umask) {
+                    Ok((f_attr, f_gen)) => {
+                        *attr = Some(f_attr);
+                        *generation = f_gen;
+                    }
+                    Err(e) => *errno = Some(e),
+                }
+            }
 
-            Message::Rmdir {
-                errno,
-                parent,
-                name,
-            } => *errno = data.rmdir(*parent, buf_to_osstr(name)).err(),
+            Message::Unlink => {
+                let Unlink {
+                    errno,
+                    parent,
+                    name,
+                } = unsafe { &mut payload.unlink };
+                *errno = data.unlink(*parent, buf_to_osstr(name)).err()
+            }
 
-            Message::Rename {
-                errno,
-                parent,
-                name,
-                newparent,
-                newname,
-            } => {
+            Message::Rmdir => {
+                let Rmdir {
+                    errno,
+                    parent,
+                    name,
+                } = unsafe { &mut payload.rmdir };
+                *errno = data.rmdir(*parent, buf_to_osstr(name)).err()
+            }
+
+            Message::Rename => {
+                let Rename {
+                    errno,
+                    parent,
+                    name,
+                    newparent,
+                    newname,
+                } = unsafe { &mut payload.rename };
                 *errno = data
                     .rename(
                         *parent,
@@ -400,7 +522,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<Message>) ->
 }
 
 pub struct RDMAFs {
-    connection: RDMAConnection<Message>,
+    connection: RDMAConnection<u8>,
     initialized: bool,
 }
 
@@ -764,19 +886,30 @@ impl LocalData {
 impl RDMAFs {
     pub fn new<W>(connection: W) -> io::Result<Self>
     where
-        W: Read + Write,
+        W: io::Read + io::Write,
     {
         Ok(Self {
-            connection: RDMAConnection::new(1, connection)?,
+            connection: RDMAConnection::new(RDMA_MESSAGE_BUFFER_SIZE, connection)?,
             initialized: false,
         })
+    }
+
+    fn tag(&mut self) -> &mut Message {
+        let (tag, _): &mut (Message, MessagePayload) =
+            unsafe { &mut *(self.connection.as_mut_ptr() as *mut (Message, MessagePayload)) };
+        tag
+    }
+    fn payload(&mut self) -> &mut MessagePayload {
+        let (_, payload): &mut (Message, MessagePayload) =
+            unsafe { &mut *(self.connection.as_mut_ptr() as *mut (Message, MessagePayload)) };
+        payload
     }
 }
 
 impl Drop for RDMAFs {
     fn drop(&mut self) {
         if self.initialized {
-            self.connection[0] = Message::Exit;
+            *self.tag() = Message::Exit;
             self.connection.send().unwrap();
         }
     }
@@ -788,10 +921,15 @@ impl Filesystem for RDMAFs {
             .recv()
             .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))?;
         assert!(
-            self.connection[0] == Message::Startup { server: true },
+            *self.tag() == Message::Startup,
             "Failed startup handshake (client)"
         );
-        self.connection[0] = Message::Startup { server: false };
+        assert!(
+            unsafe { self.payload().startup } == Startup { server: true },
+            "Failed startup handshake (client)(payload)"
+        );
+        *self.tag() = Message::Startup;
+        self.payload().startup = Startup { server: false };
         self.connection
             .send()
             .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))?;
@@ -807,29 +945,32 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; MAX_FILENAME_LENGTH];
         &mut buf[..name.len()].copy_from_slice(name);
         exchange!(
-            Message::Lookup {
+            Message::Lookup,
+            lookup,
+            Lookup {
                 parent,
                 name: buf,
                 attr: None,
                 generation: 0,
                 errno: None,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::Lookup {
-                errno,
-                attr,
-                generation,
-                ..
-            } => {
-                if let Some(errno) = errno {
+        match *self.tag() {
+            Message::Lookup => {
+                let Lookup {
+                    errno,
+                    attr,
+                    generation,
+                    ..
+                } = unsafe { &self.payload().lookup };
+                if let Some(errno) = *errno {
                     reply.error(errno);
                 } else {
                     reply.entry(
                         &std::time::Duration::ZERO,
                         &attr.expect("A reply should contain the attr"),
-                        generation,
+                        *generation,
                     );
                 }
             }
@@ -840,16 +981,19 @@ impl Filesystem for RDMAFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         exchange!(
-            Message::GetAttr {
+            Message::GetAttr,
+            get_attr,
+            GetAttr {
                 ino,
                 attr: None,
                 errno: None,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::GetAttr { attr, errno, .. } => {
-                if let Some(errno) = errno {
+        match *self.tag() {
+            Message::GetAttr => {
+                let GetAttr { attr, errno, .. } = unsafe { &self.payload().get_attr };
+                if let Some(errno) = *errno {
                     reply.error(errno);
                 } else {
                     reply.attr(
@@ -901,7 +1045,9 @@ impl Filesystem for RDMAFs {
         buf[0..name.len()].copy_from_slice(name.as_bytes());
 
         exchange!(
-            Message::Mkdir {
+            Message::Mkdir,
+            mkdir,
+            Mkdir {
                 errno: None,
                 parent,
                 name: buf,
@@ -910,16 +1056,17 @@ impl Filesystem for RDMAFs {
                 attr: None,
                 generation: 0,
             },
-            self.connection
+            self
         );
 
-        match self.connection[0] {
-            Message::Mkdir {
-                errno,
-                attr,
-                generation,
-                ..
-            } => {
+        match *self.tag() {
+            Message::Mkdir => {
+                let Mkdir {
+                    errno,
+                    attr,
+                    generation,
+                    ..
+                } = unsafe { self.payload().mkdir };
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -940,16 +1087,17 @@ impl Filesystem for RDMAFs {
         buf[0..name.len()].copy_from_slice(name.as_bytes());
 
         exchange! {
-            Message::Unlink {
+            Message::Unlink, unlink, Unlink  {
                 errno: None,
                 parent,
                 name: buf,
             },
-            self.connection
+            self
         };
 
-        match self.connection[0] {
-            Message::Unlink { errno, .. } => {
+        match *self.tag() {
+            Message::Unlink => {
+                let errno = unsafe { self.payload().unlink }.errno;
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -965,11 +1113,12 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; MAX_FILENAME_LENGTH];
         buf[0..name.len()].copy_from_slice(name.as_bytes());
         exchange! {
-            Message::Rmdir {errno: None, parent, name: buf},
-            self.connection
+            Message::Rmdir, rmdir, Rmdir  {errno: None, parent, name: buf},
+            self
         };
-        match self.connection[0] {
-            Message::Rmdir { errno, .. } => {
+        match *self.tag() {
+            Message::Rmdir => {
+                let errno = unsafe { self.payload().rmdir }.errno;
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1008,16 +1157,19 @@ impl Filesystem for RDMAFs {
         newbuf[0..newname.len()].copy_from_slice(newname.as_bytes());
 
         exchange! {
-            Message::Rename {
+            Message::Rename,
+            rename,
+            Rename  {
                 errno: None,
                 parent,
                 name: buf,
                 newparent,
                 newname: newbuf,
-            }, self.connection
+            }, self
         };
-        match self.connection[0] {
-            Message::Rename { errno, .. } => {
+        match *self.tag() {
+            Message::Rename => {
+                let errno = unsafe { self.payload().rename }.errno;
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1042,22 +1194,25 @@ impl Filesystem for RDMAFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         exchange!(
-            Message::Open {
+            Message::Open,
+            open,
+            Open {
                 ino,
                 flags,
                 fh: 0,
                 open_flags: 0,
                 errno: None,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::Open {
-                fh,
-                open_flags,
-                errno,
-                ..
-            } => {
+        match *self.tag() {
+            Message::Open => {
+                let Open {
+                    fh,
+                    open_flags,
+                    errno,
+                    ..
+                } = unsafe { self.payload().open };
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1081,23 +1236,26 @@ impl Filesystem for RDMAFs {
         reply: ReplyData,
     ) {
         exchange!(
-            Message::Read {
+            Message::Read,
+            read,
+            Read {
                 errno: None,
                 fh,
                 offset,
                 size,
                 buf: [0; READ_WRITE_BUFFER_SIZE],
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::Read {
-                errno, buf, size, ..
-            } => {
-                if let Some(errno) = errno {
+        match self.tag() {
+            Message::Read => {
+                let Read {
+                    errno, buf, size, ..
+                } = unsafe { &self.payload().read };
+                if let Some(errno) = *errno {
                     reply.error(errno);
                 } else {
-                    reply.data(&buf[..size as usize]);
+                    reply.data(&buf[..*size as usize]);
                 }
             }
             Message::Null => reply.error(ENOSYS),
@@ -1121,21 +1279,24 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; READ_WRITE_BUFFER_SIZE];
         buf[0..data.len()].copy_from_slice(data);
         exchange!(
-            Message::Write {
+            Message::Write,
+            write,
+            Write {
                 errno: None,
                 fh,
                 offset,
                 data: buf,
                 written: data.len() as _,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::Write { errno, written, .. } => {
-                if let Some(errno) = errno {
+        match self.tag() {
+            Message::Write => {
+                let Write { errno, written, .. } = unsafe { &self.payload().write };
+                if let Some(errno) = *errno {
                     reply.error(errno);
                 } else {
-                    reply.written(written);
+                    reply.written(*written);
                 }
             }
             Message::Null => reply.error(ENOSYS),
@@ -1151,9 +1312,10 @@ impl Filesystem for RDMAFs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        exchange!(Message::Flush { errno: None, fh }, self.connection);
-        match self.connection[0] {
-            Message::Flush { errno, .. } => {
+        exchange!(Message::Flush, flush, Flush { errno: None, fh }, self);
+        match *self.tag() {
+            Message::Flush => {
+                let errno = unsafe { self.payload().flush }.errno;
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1176,15 +1338,18 @@ impl Filesystem for RDMAFs {
         reply: ReplyEmpty,
     ) {
         exchange!(
-            Message::Release {
+            Message::Release,
+            release,
+            Release {
                 ino,
                 fh,
                 errno: None,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::Release { errno, .. } => {
+        match *self.tag() {
+            Message::Release => {
+                let errno = unsafe { self.payload().release }.errno;
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1198,22 +1363,25 @@ impl Filesystem for RDMAFs {
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         exchange!(
-            Message::OpenDir {
+            Message::OpenDir,
+            open_dir,
+            OpenDir {
                 ino,
                 flags,
                 fh: 0,
                 open_flags: 0,
                 errno: None,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
-            Message::OpenDir {
-                fh,
-                open_flags,
-                errno,
-                ..
-            } => {
+        match *self.tag() {
+            Message::OpenDir => {
+                let OpenDir {
+                    fh,
+                    open_flags,
+                    errno,
+                    ..
+                } = unsafe { self.payload().open_dir };
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1237,7 +1405,8 @@ impl Filesystem for RDMAFs {
         _offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        self.connection[0] = Message::ReadDir {
+        *self.tag() = Message::ReadDir;
+        self.payload().read_dir = ReadDir {
             ino,
             fh,
             finished: false,
@@ -1248,22 +1417,23 @@ impl Filesystem for RDMAFs {
             name: [0; MAX_FILENAME_LENGTH],
         };
         loop {
-            exchange!(self.connection);
-            match &mut self.connection[0] {
+            exchange!(self);
+            match self.tag() {
                 Message::Null => {
                     reply.error(ENOSYS);
                     return;
                 }
 
-                Message::ReadDir {
-                    errno,
-                    buf_ino,
-                    offset,
-                    kind,
-                    name,
-                    finished,
-                    ..
-                } => {
+                Message::ReadDir => {
+                    let ReadDir {
+                        errno,
+                        buf_ino,
+                        offset,
+                        kind,
+                        name,
+                        finished,
+                        ..
+                    } = unsafe { &mut self.payload().read_dir };
                     if *finished {
                         break;
                     } else if let Some(errno) = *errno {
@@ -1289,10 +1459,16 @@ impl Filesystem for RDMAFs {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        exchange!(Message::ReleaseDir { errno: None, fh }, self.connection);
-        match self.connection[0] {
+        exchange!(
+            Message::ReleaseDir,
+            release_dir,
+            ReleaseDir { errno: None, fh },
+            self
+        );
+        match *self.tag() {
             Message::Null => reply.error(ENOSYS),
-            Message::ReleaseDir { errno, .. } => {
+            Message::ReleaseDir => {
+                let errno = unsafe { self.payload().release_dir.errno };
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1324,7 +1500,9 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; MAX_FILENAME_LENGTH];
         buf[0..name.len()].copy_from_slice(name.as_bytes());
         exchange!(
-            Message::Create {
+            Message::Create,
+            create,
+            Create {
                 errno: None,
                 parent,
                 name: buf,
@@ -1334,18 +1512,19 @@ impl Filesystem for RDMAFs {
                 fh: 0,
                 open_flags: 0,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
+        match *self.tag() {
             Message::Null => reply.error(ENOSYS),
-            Message::Create {
-                errno,
-                attr,
-                generation,
-                fh,
-                open_flags,
-                ..
-            } => {
+            Message::Create => {
+                let Create {
+                    errno,
+                    attr,
+                    generation,
+                    fh,
+                    open_flags,
+                    ..
+                } = unsafe { self.payload().create };
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {
@@ -1372,17 +1551,20 @@ impl Filesystem for RDMAFs {
         reply: ReplyLseek,
     ) {
         exchange!(
-            Message::LSeek {
+            Message::LSeek,
+            l_seek,
+            LSeek {
                 errno: None,
                 fh,
                 offset,
                 whence,
             },
-            self.connection
+            self
         );
-        match self.connection[0] {
+        match *self.tag() {
             Message::Null => reply.error(ENOSYS),
-            Message::LSeek { errno, offset, .. } => {
+            Message::LSeek => {
+                let LSeek { errno, offset, .. } = unsafe { self.payload().l_seek };
                 if let Some(errno) = errno {
                     reply.error(errno);
                 } else {

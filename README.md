@@ -3,6 +3,11 @@ Completed for Reed's Topics in Systems class. Professor is [Eitan Frachtenberg](
 
 Ian Wahbe
 
+### Warning
+
+This is not a stable system and should not be used in production. All software
+is provided as is and without warranty. 
+
 ### Building
 
 The program should compile fine with `cargo build`. It does need rust's nightly

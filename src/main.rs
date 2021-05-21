@@ -1,7 +1,7 @@
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use env_logger;
 use fuser::spawn_mount;
-use rdma_fuse::{remote_server, LocalMount, RDMAConnection, RDMAFs};
+use rdma_fuse::{remote_server, LocalMount, RDMAConnection, RDMAFs, RDMA_MESSAGE_BUFFER_SIZE};
 use std::{io, io::stdin, net::ToSocketAddrs, path::PathBuf};
 use std::{net::TcpStream, str::FromStr};
 
@@ -248,7 +248,7 @@ fn handle_remote(matches: &ArgMatches) -> io::Result<()> {
         .map(|s| PathBuf::from_str(&s).unwrap())
     {
         let con = std::net::TcpListener::bind(&port)?.accept()?.0;
-        let mut con = RDMAConnection::new(1, con)?;
+        let mut con = RDMAConnection::new(RDMA_MESSAGE_BUFFER_SIZE, con)?;
         remote_server(mountpoint, &mut con)?;
     } else {
         let con = connect_port(&port)?;

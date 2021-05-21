@@ -7,7 +7,7 @@ mod local;
 mod remote;
 
 pub use local::LocalMount;
-pub use remote::{remote_server, RDMAFs};
+pub use remote::{remote_server, RDMAFs, RDMA_MESSAGE_BUFFER_SIZE};
 
 use bincode;
 use ibverbs::{CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair};
@@ -99,25 +99,36 @@ where
         })
     }
 
-    // Send the entire buffer back.
-    pub fn send(&mut self) -> io::Result<()> {
+    pub unsafe fn send_sized(&mut self, size: usize) -> io::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
         // Unsafe: we perform the unsafe send. This is safe because `self.mem`
         // is a correctly configured memory region. It is up to the sender to
         // ensure that recieve is called.
-        unsafe { self.qp.post_send(&mut self.mem, .., id) }?;
+        self.qp.post_send(&mut self.mem, ..size, id)?;
+        self.complete(id)
+    }
+
+    // Send the entire buffer back.
+    pub fn send(&mut self) -> io::Result<()> {
+        unsafe { self.send_sized(self.mem.len()) }
+    }
+
+    /// Recieve a left aligned block of length `size`. The caller is responcible
+    /// for garenteing that the data read from the memory region is valid if
+    /// only `size` bytes are written to it.
+    pub unsafe fn recv_sized(&mut self, size: usize) -> io::Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        // Unsafe: It is up the caller to ensure that `complete` is called at
+        // the other end.
+        self.qp.post_receive(&mut self.mem, ..size, id)?;
         self.complete(id)
     }
 
     // recieve on the buffer.
     pub fn recv(&mut self) -> io::Result<()> {
-        let id = self.next_id;
-        self.next_id += 1;
-        // Unsafe: It is up the caller to ensure that `complete` is called at
-        // the other end.
-        unsafe { self.qp.post_receive(&mut self.mem, .., id) }?;
-        self.complete(id)
+        unsafe { self.recv_sized(self.mem.len()) }
     }
 
     // Waits on the completion of a send or recieve with a matching `id`.
