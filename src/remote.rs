@@ -10,6 +10,7 @@ use std::{
     convert::TryInto,
     ffi::{CStr, CString, OsStr},
     fs, io,
+    mem::size_of,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::PathBuf,
     sync::atomic::AtomicBool,
@@ -18,29 +19,52 @@ use std::{
 const MAX_FILENAME_LENGTH: usize = 255;
 const READ_WRITE_BUFFER_SIZE: usize = 2usize.pow(13);
 
-pub const RDMA_MESSAGE_BUFFER_SIZE: usize = std::mem::size_of::<(Message, MessagePayload)>();
+pub const RDMA_MESSAGE_BUFFER_SIZE: usize = size_of::<BufferLayout>();
+
+#[repr(C)]
+struct BufferLayout {
+    tag: Message,
+    payload: MessagePayload,
+}
 
 macro_rules! exchange {
-    ($msg: expr, $name: ident, $load: expr, $con: expr) => {
-        *$con.tag() = $msg;
+    ($msg: ident, $name: ident, $load: expr, $con: expr) => {
+        *$con.tag() = Message::$msg;
         $con.payload().$name = $load;
-        exchange!($con);
+        exchange!($msg, $con);
     };
-    ($msg: expr, $con: expr) => {
-        $con[0].0 = $msg;
-        exchange!($con);
-    };
-    ($con: expr) => {
-        $con.connection
-            .send()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
-        $con.connection
-            .recv()
-            .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
-            .unwrap();
+    ($type: ident, $con: expr) => {
+        unsafe {
+            let size = payload_size::<$type>($con.connection.as_mut_ptr());
+            $con.connection.send_sized(size_of::<Message>()).unwrap();
+            $con.connection
+                .send_sized(size)
+                .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+                .unwrap();
+            $con.connection
+                .recv_sized(size)
+                .map_err(|e| e.raw_os_error().unwrap_or(EREMOTEIO))
+                .unwrap();
+        }
     };
 }
+
+fn payload_size<T>(buf: *mut u8) -> usize {
+    // In a perfect world, this would be const
+    let base = buf as usize;
+    let payload_offset = get_payload(buf) as *mut _ as *const u8 as usize;
+    let offset: usize = payload_offset - base;
+    offset + size_of::<T>()
+}
+
+fn get_payload(buf: *mut u8) -> &'static mut MessagePayload {
+    unsafe { &mut (*(buf as *mut BufferLayout)).payload }
+}
+
+fn get_tag(buf: *mut u8) -> &'static mut Message {
+    unsafe { &mut (*(buf as *mut BufferLayout)).tag }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct GetAttr {
     errno: Option<i32>,
@@ -49,144 +73,145 @@ struct GetAttr {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Lookup {
-    pub errno: Option<i32>,
-    pub parent: Ino,
-    pub name: [u8; MAX_FILENAME_LENGTH],
-    pub attr: Option<FileAttr>,
-    pub generation: u64,
+struct Lookup {
+    errno: Option<i32>,
+    parent: Ino,
+    name: [u8; MAX_FILENAME_LENGTH],
+    attr: Option<FileAttr>,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Startup {
-    pub server: bool,
+struct Startup {
+    server: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct OpenDir {
-    pub errno: Option<i32>,
-    pub ino: Ino,
-    pub flags: i32,
-    pub fh: Fh,
-    pub open_flags: u32,
+struct OpenDir {
+    errno: Option<i32>,
+    ino: Ino,
+    flags: i32,
+    fh: Fh,
+    open_flags: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct ReadDir {
-    pub ino: Ino,
-    pub fh: Fh,
-    pub finished: bool,
-    pub errno: Option<i32>,
-    pub buf_ino: Ino,
-    pub offset: i64,
-    pub kind: FileType,
-    pub name: [u8; MAX_FILENAME_LENGTH],
+struct ReadDir {
+    ino: Ino,
+    fh: Fh,
+    finished: bool,
+    errno: Option<i32>,
+    buf_ino: Ino,
+    offset: i64,
+    kind: FileType,
+    name: [u8; MAX_FILENAME_LENGTH],
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct ReleaseDir {
-    pub fh: Fh,
-    pub errno: Option<i32>,
+struct ReleaseDir {
+    fh: Fh,
+    errno: Option<i32>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Open {
-    pub errno: Option<i32>,
-    pub ino: Ino,
-    pub flags: i32,
-    pub fh: Fh,
-    pub open_flags: u32,
+struct Open {
+    errno: Option<i32>,
+    ino: Ino,
+    flags: i32,
+    fh: Fh,
+    open_flags: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Release {
-    pub errno: Option<i32>,
-    pub ino: Ino,
-    pub fh: Fh,
+struct Release {
+    errno: Option<i32>,
+    ino: Ino,
+    fh: Fh,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Flush {
-    pub errno: Option<i32>,
-    pub fh: Fh,
+struct Flush {
+    errno: Option<i32>,
+    fh: Fh,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct LSeek {
-    pub errno: Option<i32>,
-    pub fh: Fh,
-    pub offset: i64,
-    pub whence: i32,
+struct LSeek {
+    errno: Option<i32>,
+    fh: Fh,
+    offset: i64,
+    whence: i32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Create {
-    pub errno: Option<i32>,
-    pub parent: Ino,
-    pub name: [u8; MAX_FILENAME_LENGTH],
-    pub flags: i32,
-    pub attr: Option<FileAttr>,
-    pub generation: u64,
-    pub fh: Fh,
-    pub open_flags: u32,
+struct Create {
+    errno: Option<i32>,
+    parent: Ino,
+    name: [u8; MAX_FILENAME_LENGTH],
+    flags: i32,
+    attr: Option<FileAttr>,
+    generation: u64,
+    fh: Fh,
+    open_flags: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Mkdir {
-    pub errno: Option<i32>,
-    pub parent: Ino,
-    pub name: [u8; MAX_FILENAME_LENGTH],
-    pub mode: u32,
-    pub umask: u32,
-    pub attr: Option<FileAttr>,
-    pub generation: u64,
+struct Mkdir {
+    errno: Option<i32>,
+    parent: Ino,
+    name: [u8; MAX_FILENAME_LENGTH],
+    mode: u32,
+    umask: u32,
+    attr: Option<FileAttr>,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Unlink {
-    pub errno: Option<i32>,
-    pub parent: Ino,
-    pub name: [u8; MAX_FILENAME_LENGTH],
+struct Unlink {
+    errno: Option<i32>,
+    parent: Ino,
+    name: [u8; MAX_FILENAME_LENGTH],
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Rmdir {
-    pub errno: Option<i32>,
-    pub parent: Ino,
-    pub name: [u8; MAX_FILENAME_LENGTH],
+struct Rmdir {
+    errno: Option<i32>,
+    parent: Ino,
+    name: [u8; MAX_FILENAME_LENGTH],
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Rename {
-    pub errno: Option<i32>,
-    pub parent: Ino,
-    pub name: [u8; MAX_FILENAME_LENGTH],
-    pub newparent: Ino,
-    pub newname: [u8; MAX_FILENAME_LENGTH],
+struct Rename {
+    errno: Option<i32>,
+    parent: Ino,
+    name: [u8; MAX_FILENAME_LENGTH],
+    newparent: Ino,
+    newname: [u8; MAX_FILENAME_LENGTH],
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Read {
-    pub errno: Option<i32>,
-    pub fh: Fh,
-    pub offset: i64,
-    pub size: u32,
-    pub buf: [u8; READ_WRITE_BUFFER_SIZE],
+struct Read {
+    errno: Option<i32>,
+    fh: Fh,
+    offset: i64,
+    size: u32,
+    buf: [u8; READ_WRITE_BUFFER_SIZE],
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct Write {
-    pub errno: Option<i32>,
-    pub fh: Fh,
-    pub offset: i64,
-    pub data: [u8; READ_WRITE_BUFFER_SIZE],
+struct Write {
+    errno: Option<i32>,
+    fh: Fh,
+    offset: i64,
+    data: [u8; READ_WRITE_BUFFER_SIZE],
     /// When a request is made, `written` holds the number of bytes to
     /// write. A reply contains the number of bytes written.
-    pub written: u32,
+    written: u32,
 }
 
 #[derive(Clone, Copy)]
-pub union MessagePayload {
+#[repr(C)]
+union MessagePayload {
     startup: Startup,
     lookup: Lookup,
     get_attr: GetAttr,
@@ -217,7 +242,8 @@ impl Default for MessagePayload {
 /// the information necessary for both a request and a reply. The client loads
 /// the request fields, and gets back a fully filled out reply.
 #[derive(Clone, Copy, PartialEq)]
-pub enum Message {
+enum Message {
+    // This way a default (zerod) buffer contains null.
     Null = 0,
     Exit,
     Startup,
@@ -254,9 +280,9 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
         RDMA_MESSAGE_BUFFER_SIZE,
         "We need a correctly sized RDMA buffer"
     );
-    let (tag, payload): &mut (Message, MessagePayload) =
-        unsafe { &mut *(connection.as_mut_ptr() as *mut (Message, MessagePayload)) };
+    let mut tag = get_tag(connection.as_mut_ptr());
     *tag = Message::Startup;
+    let mut payload = get_payload(connection.as_mut_ptr());
     payload.startup = Startup { server: true };
     connection.send().unwrap();
     connection.recv().unwrap();
@@ -280,8 +306,43 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
             return Ok(());
         }
 
-        connection.recv()?;
-
+        unsafe {
+            connection.recv_sized(size_of::<Message>())?;
+        }
+        tag = get_tag(connection.as_mut_ptr());
+        macro_rules! recv {
+            ($load: ident) => {{
+                let size = payload_size::<$load>(connection.as_mut_ptr());
+                unsafe { connection.recv_sized(size)? }
+            }};
+        }
+        match *tag {
+            Message::Null | Message::Exit => {}
+            Message::Startup => recv!(Startup),
+            Message::Lookup => recv!(Lookup),
+            Message::GetAttr => recv!(GetAttr),
+            Message::OpenDir => recv!(OpenDir),
+            Message::ReadDir => recv!(ReadDir),
+            Message::ReleaseDir => recv!(ReleaseDir),
+            Message::Open => recv!(Open),
+            Message::Release => recv!(Release),
+            Message::Read => recv!(Read),
+            Message::Write => recv!(Write),
+            Message::Flush => recv!(Flush),
+            Message::LSeek => recv!(LSeek),
+            Message::Create => recv!(Create),
+            Message::Mkdir => recv!(Mkdir),
+            Message::Unlink => recv!(Unlink),
+            Message::Rmdir => recv!(Rmdir),
+            Message::Rename => recv!(Rename),
+        }
+        payload = get_payload(connection.as_mut_ptr());
+        macro_rules! send {
+            ($load: ident) => {{
+                let size = payload_size::<$load>(connection.as_mut_ptr());
+                unsafe { connection.send_sized(size)? }
+            }};
+        }
         match tag {
             Message::Exit => {
                 println!("Recieved exit command. Goodbye!");
@@ -290,6 +351,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
             Message::Startup => {
                 unsafe { assert!(!payload.startup.server) };
                 println!("Recieved unexpected startup command.");
+                send!(Startup);
             }
             Message::Null => {}
             Message::Lookup => {
@@ -307,6 +369,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     }
                     Err(e) => *errno = Some(e),
                 }
+                send!(Lookup);
             }
             Message::GetAttr => {
                 let GetAttr { errno, ino, attr } = unsafe { &mut payload.get_attr };
@@ -320,6 +383,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                         *attr = None;
                     }
                 }
+                send!(GetAttr);
             }
             Message::OpenDir => {
                 let OpenDir {
@@ -337,10 +401,12 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     }
                     Err(e) => *errno = Some(e),
                 }
+                send!(OpenDir);
             }
             Message::ReleaseDir => {
                 let ReleaseDir { fh, errno } = unsafe { &mut payload.release_dir };
-                *errno = data.releasedir(*fh).err()
+                *errno = data.releasedir(*fh).err();
+                send!(ReleaseDir);
             }
 
             Message::ReadDir => {
@@ -365,6 +431,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     Ok(None) => *finished = true,
                     Err(e) => *errno = Some(e),
                 }
+                send!(ReadDir);
             }
 
             Message::Open => {
@@ -383,11 +450,13 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     }
                     Err(e) => *errno = Some(e),
                 }
+                send!(Open);
             }
 
             Message::Release => {
                 let Release { errno, ino, fh } = unsafe { &mut payload.release };
-                *errno = data.release(*ino, *fh).err()
+                *errno = data.release(*ino, *fh).err();
+                send!(Release);
             }
 
             Message::Read => {
@@ -402,6 +471,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     Ok(bytes_read) => *size = bytes_read as _,
                     Err(e) => *errno = Some(e),
                 }
+                send!(Read);
             }
 
             Message::Write => {
@@ -419,11 +489,13 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     }
                     Err(e) => *errno = Some(e),
                 }
+                send!(Write);
             }
 
             Message::Flush => {
                 let Flush { errno, fh } = unsafe { &mut payload.flush };
-                *errno = data.flush(*fh).err()
+                *errno = data.flush(*fh).err();
+                send!(Flush);
             }
 
             Message::LSeek => {
@@ -437,6 +509,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     Ok(k) => *offset = k,
                     Err(e) => *errno = Some(e),
                 }
+                send!(LSeek);
             }
 
             Message::Create => {
@@ -460,6 +533,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     }
                     Err(e) => *errno = Some(e),
                 }
+                send!(Create);
             }
 
             Message::Mkdir => {
@@ -479,6 +553,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     }
                     Err(e) => *errno = Some(e),
                 }
+                send!(Mkdir);
             }
 
             Message::Unlink => {
@@ -487,7 +562,8 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     parent,
                     name,
                 } = unsafe { &mut payload.unlink };
-                *errno = data.unlink(*parent, buf_to_osstr(name)).err()
+                *errno = data.unlink(*parent, buf_to_osstr(name)).err();
+                send!(Unlink);
             }
 
             Message::Rmdir => {
@@ -496,7 +572,8 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     parent,
                     name,
                 } = unsafe { &mut payload.rmdir };
-                *errno = data.rmdir(*parent, buf_to_osstr(name)).err()
+                *errno = data.rmdir(*parent, buf_to_osstr(name)).err();
+                send!(Rmdir);
             }
 
             Message::Rename => {
@@ -514,10 +591,10 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                         *newparent,
                         buf_to_osstr(newname),
                     )
-                    .err()
+                    .err();
+                send!(Rename);
             }
         }
-        connection.send()?;
     }
 }
 
@@ -894,15 +971,11 @@ impl RDMAFs {
         })
     }
 
-    fn tag(&mut self) -> &mut Message {
-        let (tag, _): &mut (Message, MessagePayload) =
-            unsafe { &mut *(self.connection.as_mut_ptr() as *mut (Message, MessagePayload)) };
-        tag
+    fn tag<'a>(&'a mut self) -> &'a mut Message {
+        get_tag(self.connection.as_mut_ptr())
     }
-    fn payload(&mut self) -> &mut MessagePayload {
-        let (_, payload): &mut (Message, MessagePayload) =
-            unsafe { &mut *(self.connection.as_mut_ptr() as *mut (Message, MessagePayload)) };
-        payload
+    fn payload<'a>(&'a mut self) -> &'a mut MessagePayload {
+        get_payload(self.connection.as_mut_ptr())
     }
 }
 
@@ -910,7 +983,7 @@ impl Drop for RDMAFs {
     fn drop(&mut self) {
         if self.initialized {
             *self.tag() = Message::Exit;
-            self.connection.send().unwrap();
+            unsafe { self.connection.send_sized(size_of::<Message>()).unwrap() };
         }
     }
 }
@@ -945,7 +1018,7 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; MAX_FILENAME_LENGTH];
         &mut buf[..name.len()].copy_from_slice(name);
         exchange!(
-            Message::Lookup,
+            Lookup,
             lookup,
             Lookup {
                 parent,
@@ -969,7 +1042,7 @@ impl Filesystem for RDMAFs {
                 } else {
                     reply.entry(
                         &std::time::Duration::ZERO,
-                        &attr.expect("A reply should contain the attr"),
+                        &attr.expect("A reply should contain the attr (lookup)"),
                         *generation,
                     );
                 }
@@ -981,7 +1054,7 @@ impl Filesystem for RDMAFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         exchange!(
-            Message::GetAttr,
+            GetAttr,
             get_attr,
             GetAttr {
                 ino,
@@ -998,7 +1071,7 @@ impl Filesystem for RDMAFs {
                 } else {
                     reply.attr(
                         &std::time::Duration::ZERO,
-                        &attr.expect("A reply should contain the attr"),
+                        &attr.expect("A reply should contain the attr (getattr)"),
                     )
                 }
             }
@@ -1045,7 +1118,7 @@ impl Filesystem for RDMAFs {
         buf[0..name.len()].copy_from_slice(name.as_bytes());
 
         exchange!(
-            Message::Mkdir,
+            Mkdir,
             mkdir,
             Mkdir {
                 errno: None,
@@ -1087,7 +1160,7 @@ impl Filesystem for RDMAFs {
         buf[0..name.len()].copy_from_slice(name.as_bytes());
 
         exchange! {
-            Message::Unlink, unlink, Unlink  {
+            Unlink, unlink, Unlink  {
                 errno: None,
                 parent,
                 name: buf,
@@ -1113,7 +1186,7 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; MAX_FILENAME_LENGTH];
         buf[0..name.len()].copy_from_slice(name.as_bytes());
         exchange! {
-            Message::Rmdir, rmdir, Rmdir  {errno: None, parent, name: buf},
+            Rmdir, rmdir, Rmdir  {errno: None, parent, name: buf},
             self
         };
         match *self.tag() {
@@ -1157,7 +1230,7 @@ impl Filesystem for RDMAFs {
         newbuf[0..newname.len()].copy_from_slice(newname.as_bytes());
 
         exchange! {
-            Message::Rename,
+            Rename,
             rename,
             Rename  {
                 errno: None,
@@ -1194,7 +1267,7 @@ impl Filesystem for RDMAFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         exchange!(
-            Message::Open,
+            Open,
             open,
             Open {
                 ino,
@@ -1236,7 +1309,7 @@ impl Filesystem for RDMAFs {
         reply: ReplyData,
     ) {
         exchange!(
-            Message::Read,
+            Read,
             read,
             Read {
                 errno: None,
@@ -1279,7 +1352,7 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; READ_WRITE_BUFFER_SIZE];
         buf[0..data.len()].copy_from_slice(data);
         exchange!(
-            Message::Write,
+            Write,
             write,
             Write {
                 errno: None,
@@ -1312,7 +1385,7 @@ impl Filesystem for RDMAFs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        exchange!(Message::Flush, flush, Flush { errno: None, fh }, self);
+        exchange!(Flush, flush, Flush { errno: None, fh }, self);
         match *self.tag() {
             Message::Flush => {
                 let errno = unsafe { self.payload().flush }.errno;
@@ -1338,7 +1411,7 @@ impl Filesystem for RDMAFs {
         reply: ReplyEmpty,
     ) {
         exchange!(
-            Message::Release,
+            Release,
             release,
             Release {
                 ino,
@@ -1363,7 +1436,7 @@ impl Filesystem for RDMAFs {
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         exchange!(
-            Message::OpenDir,
+            OpenDir,
             open_dir,
             OpenDir {
                 ino,
@@ -1417,7 +1490,7 @@ impl Filesystem for RDMAFs {
             name: [0; MAX_FILENAME_LENGTH],
         };
         loop {
-            exchange!(self);
+            exchange!(ReadDir, self);
             match self.tag() {
                 Message::Null => {
                     reply.error(ENOSYS);
@@ -1460,7 +1533,7 @@ impl Filesystem for RDMAFs {
         reply: ReplyEmpty,
     ) {
         exchange!(
-            Message::ReleaseDir,
+            ReleaseDir,
             release_dir,
             ReleaseDir { errno: None, fh },
             self
@@ -1500,7 +1573,7 @@ impl Filesystem for RDMAFs {
         let mut buf = [0; MAX_FILENAME_LENGTH];
         buf[0..name.len()].copy_from_slice(name.as_bytes());
         exchange!(
-            Message::Create,
+            Create,
             create,
             Create {
                 errno: None,
@@ -1551,7 +1624,7 @@ impl Filesystem for RDMAFs {
         reply: ReplyLseek,
     ) {
         exchange!(
-            Message::LSeek,
+            LSeek,
             l_seek,
             LSeek {
                 errno: None,

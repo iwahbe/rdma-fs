@@ -29,11 +29,11 @@ only the correct amount of data with each RDMA send verb.
 ** [2/2] Convert =enum= to tagged union
 *** DONE Convert
 *** DONE Test
-** [1/2] Convert =RDMAConnection= to use multiple =u8= instead of a single =(Message, MessagePayload)=
+** [2/2] Convert =RDMAConnection= to use multiple =u8= instead of a single =(Message, MessagePayload)=
 *** DONE Convert
-*** TODO Test
-** [0/2] Send only the correct amount
-*** TODO Convert
+*** DONE Test
+** [1/2] Send only the correct amount
+*** DONE Convert
 *** TODO Test
 
 * [0/2] Buffer Reads and Writes

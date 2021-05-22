@@ -99,6 +99,12 @@ where
         })
     }
 
+    /// Send a left aligned block of length `size`. The caller is responcible
+    /// for garenteing that the data read from the memory region is valid if
+    /// only `size` bytes are written to it.
+    ///
+    /// Safety: This function is unsafe. It is up to the caller to ensure that
+    /// the type that it is sending fits in `size` bytes.
     pub unsafe fn send_sized(&mut self, size: usize) -> io::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
@@ -117,11 +123,12 @@ where
     /// Recieve a left aligned block of length `size`. The caller is responcible
     /// for garenteing that the data read from the memory region is valid if
     /// only `size` bytes are written to it.
+    ///
+    /// Safety: This function is unsafe. It is up to the caller to ensure that
+    /// the type that is expected to be recieved fits in `size` bytes.
     pub unsafe fn recv_sized(&mut self, size: usize) -> io::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
-        // Unsafe: It is up the caller to ensure that `complete` is called at
-        // the other end.
         self.qp.post_receive(&mut self.mem, ..size, id)?;
         self.complete(id)
     }
