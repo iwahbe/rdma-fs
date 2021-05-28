@@ -32,9 +32,9 @@ only the correct amount of data with each RDMA send verb.
 ** [2/2] Convert =RDMAConnection= to use multiple =u8= instead of a single =(Message, MessagePayload)=
 *** DONE Convert
 *** DONE Test
-** [1/2] Send only the correct amount
+** [2/2] Send only the correct amount
 *** DONE Convert
-*** TODO Test
+*** DONE Test
 
 * [0/2] Buffer Reads and Writes
 Currently reads and writes all =send= verbs to fixed size buffer. If the
@@ -43,3 +43,10 @@ overlarge amount of data. We should instead send only some fixed amount per
 =send=, and repeat sends as needed until the message is received.
 ** TODO Implement
 ** TODO Test
+Read / Write
+Bandwidth / latency
+Sequential: read
+Check
+#+begin_src sh
+time ./fio --name TEST --eta-newline=5s --filename=fio-tempfile.dat --rw=read --size=500m --io_size=10g --blocksize=1024k --ioengine=libaio --fsync=10000 --iodepth=32 --direct=1 --numjobs=1 --runtime=60 --group_reporting
+#+end_src

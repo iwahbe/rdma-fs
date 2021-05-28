@@ -4,7 +4,10 @@ use crate::{Fh, Ino};
 use fuser::*;
 use fuser::{Filesystem, KernelConfig, Request};
 use libc::{c_int, ENOSYS, EREMOTEIO};
-use nix::errno::{errno, Errno};
+use nix::{
+    errno::{errno, Errno},
+    fcntl,
+};
 use std::{
     collections::HashMap,
     convert::TryInto,
@@ -209,6 +212,15 @@ struct Write {
     written: u32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct FAllocate {
+    errno: Option<i32>,
+    fh: u64,
+    offset: i64,
+    length: i64,
+    mode: i32,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 union MessagePayload {
@@ -229,6 +241,7 @@ union MessagePayload {
     unlink: Unlink,
     rmdir: Rmdir,
     rename: Rename,
+    fallocate: FAllocate,
     null: (),
 }
 
@@ -263,6 +276,7 @@ enum Message {
     Unlink,
     Rmdir,
     Rename,
+    FAllocate,
 }
 
 impl Default for Message {
@@ -335,6 +349,7 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
             Message::Unlink => recv!(Unlink),
             Message::Rmdir => recv!(Rmdir),
             Message::Rename => recv!(Rename),
+            Message::FAllocate => recv!(FAllocate),
         }
         payload = get_payload(connection.as_mut_ptr());
         macro_rules! send {
@@ -594,6 +609,20 @@ pub fn remote_server(root: PathBuf, connection: &mut RDMAConnection<u8>) -> io::
                     .err();
                 send!(Rename);
             }
+
+            Message::FAllocate => {
+                let FAllocate {
+                    errno,
+                    fh,
+                    offset,
+                    length,
+                    mode,
+                } = unsafe { &mut payload.fallocate };
+                *errno = data
+                    .fallocate(*fh as _, *mode as _, *offset, *length as _)
+                    .err();
+                send!(FAllocate);
+            }
         }
     }
 }
@@ -625,6 +654,26 @@ impl LocalData {
             root_ino,
             ino_paths,
             open_files: HashMap::new(),
+        }
+    }
+
+    fn fallocate(&mut self, fh: Fh, offset: i64, length: i64, mode: i32) -> Result<(), i32> {
+        if let Some(file) = self.open_files.get_mut(&fh) {
+            // There doesn't seem to be a specific flag for this.
+            let mode = fcntl::FallocateFlags::from_bits(mode).ok_or(libc::EINVAL)?;
+            match fcntl::fallocate(file.fh() as _, mode, offset as _, length as _) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e
+                    .as_errno()
+                    .map(|e| {
+                        io::Error::from(e).raw_os_error().expect(
+                            "This should be a valid Linux Errno, as it was taken from `nix`",
+                        )
+                    })
+                    .expect("Valid Linux Errno because it is derived from a `nix` errno")),
+            }
+        } else {
+            Err(libc::ENOENT)
         }
     }
 
@@ -1011,6 +1060,38 @@ impl Filesystem for RDMAFs {
     }
 
     fn destroy(&mut self, _req: &Request<'_>) {}
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        exchange! {
+            FAllocate,
+            fallocate,
+            FAllocate {
+                fh, offset, length, mode, errno: None,
+            },
+            self
+        }
+        match *self.tag() {
+            Message::FAllocate => {
+                let errno = unsafe { &self.payload().fallocate.errno };
+                if let Some(errno) = errno {
+                    reply.error(*errno);
+                } else {
+                    reply.ok();
+                }
+            }
+            Message::Null => reply.error(ENOSYS),
+            _ => panic!("Unexpected lookup"),
+        }
+    }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name = name.as_bytes();

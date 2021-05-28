@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 # custom for some extra derives
-fuser = { version = "0.7", git = "https://github.com/iwahbe/fuser.git", branch = "from-metadata-for-fileattr", features = ["serializable"]}
+fuser = { version = "0.7", git = "https://github.com/iwahbe/fuser.git", branch = "from-metadata-for-fileattr", features = ["serializable", "abi-7-19"]}
 libc = "0.2"
 nix = "0.20"
 clap = "2.33"
