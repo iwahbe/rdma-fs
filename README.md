@@ -1,21 +1,22 @@
 ## FUSE Filesystem Over RDMA
-Completed for Reed's Topics in Systems class. Professor is [Eitan Frachtenberg](https://www.reed.edu/faculty-profiles/profiles/frachtenberg-eitan.html).  
+
+Completed for Reed's Topics in Systems class. Professor is [Eitan Frachtenberg](https://www.reed.edu/faculty-profiles/profiles/frachtenberg-eitan.html).
 
 Ian Wahbe
 
 ### Warning
 
 This is not a stable system and should not be used in production. All software
-is provided as is and without warranty. 
+is provided as is and without warranty.
 
 ### Building
 
 The program should compile fine with `cargo build`. It does need rust's nightly
-compiler.
+compiler and fuser header files.
 
 ### Background <!-- (1-2 pages) -->
 
---- 
+---
 
 Hardware accelerators have evolved from small network and cryptography chips
 to full blown separate computers. As these accelerator computers are still
@@ -29,17 +30,19 @@ slower general computer, most data is kept on the host, or an external drive
 connected to the host. To avoid this, I provide a base system to intermediate
 between host and accelerator. Using the Linux philosophy of "everything is a
 file", I have written a file system mirror that allows an accelerator to read
-and write to the host file system over the network. 
+and write to the host file system over the network.
 
-I build my file system mirror on two new and distinct pieces of technology. 
+I build my file system mirror on two new and distinct pieces of technology.
 
-#### FUSE (Filesystem in Userspace) 
+#### FUSE (Filesystem in Userspace)
+
 FUSE provides a generic kernel extension, and an interaction library written in
 C (I used a Rust wrapper). Without writing my own kernel extension, this is the
 only way to allow my filesystem to be completely transparent to the user once
 mounted.
 
 #### RDMA (remote direct memory access)
+
 RDMA provides the low latency communication of data, especially buffer reads and
 writes. I use RDMA's memory region abstraction, which allows the host and
 accelerator to share (with minimal overhead) a region of memory over a local
@@ -64,7 +67,6 @@ supporting hardware. This means we are restricted to a single connection at a
 time per RDMA device. While some cards and chips can have multiple devices, it
 stills supports a distinctly limited number of connections.
 
-
 <!-- Problem description and motivation -->
 <!-- Relationship to the hardware used -->
 <!-- Any background material on relevant past work -->
@@ -79,8 +81,8 @@ files the client is accessing, and most difficult operations are performed on
 the host's native file system. For the client, I use FUSE to prevent the user
 from experiencing any difference in usage.
 
+#### Design considerations and choices for your implementation
 
-#### Design considerations and choices for your implementation 
 The technology choices I made stemmed from two main decisions. I needed to use
 FUSE and RDMA, and I wanted to write my project in Rust. There exists only 1
 maintained interface to FUSE for Rust, called
@@ -91,7 +93,7 @@ look similar. The function takes as arguments its input, and reply is a `struct`
 with methods to take either output or errors. An example method, `open`, looks
 like this:
 
-``` rust
+```rust
     fn open(&mut self, req: &Request<'_>, ino: Ino, flags: i32, reply: ReplyOpen) {
         // either
         reply.opened(file_handle, open_flags);
@@ -111,7 +113,7 @@ available for closer inspection.
 After library and language were chosen, most design decisions were made. I then
 proceeded to fill in the methods as required.
 
-#### Overview of algorithms / code / implementation 
+#### Overview of algorithms / code / implementation
 
 Given FUSE, the main design followed. I built a server that sat on the host
 (chimera), and a client that runs on the accelerator. They begin by generating a
@@ -128,7 +130,7 @@ given more or less blindly.
 
 The communication `enum` as declared goes as follows:
 
-``` rust
+```rust
 pub enum Message {
     Exit,
 
@@ -267,6 +269,7 @@ pub enum Message {
 We can describe the system as follows:
 
 <!-- I know this is not JSON, but it prevents markdown from trying to guess highlights. -->
+
 ```json
 
  +----------+                +----------+
@@ -282,7 +285,6 @@ We can describe the system as follows:
 Only the host side stores state. The client only remembers what type of call it
 is currently executing, and that is maintained by program stack.
 
-
 #### Similar Systems
 
 This sounds a lot like NFS, but is importantly different. Because the goal is to
@@ -293,9 +295,10 @@ RDMA as my message passing interface. This both reduces latency, and the
 overhead. It does have major downsides compared to NFS as well.
 
 ##### Running
+
 To actually use the system, we do the following:
 
-``` sh
+```sh
 # on the host
 ~/x86/bin/rdma-fuse remote --host target/ --ip 192.168.100.1:8393
 # on the client
@@ -305,8 +308,6 @@ To actually use the system, we do the following:
 This mounts `target` on the host system to the empty folder `mnt` on the client
 system. It uses ip address `192.168.100.1` to communicate with port `8393`.
 Detailed usage information can be found by typing `rdma-fuse help`.
-
-
 
 <!-- Design considerations and choices for your implementation -->
 <!-- Overview of algorithms / code / implementation -->
@@ -333,20 +334,20 @@ instructions.
 1. It creates files until the file system is out of memory.
 2. It randomly accesses the files it creates.
 3. It deletes and creates randomly.
-4. It deletes all files it created. 
+4. It deletes all files it created.
 
 I modified the default test, removing changing the file owners between stages.
 My implementation does not support changing ownership of files. Running a
 benchmark is done simply with a command like this one:
 
-``` sh
+```sh
 ianwahbe@bf1:/ltp-arm/testcases/kernel/fs/fs-bench/mnt$ ../fs-benchmark.sh |& tee ../result.txt
 ```
 
-I ran the test on the all three systems, as well as an internal chimera with rdma. 
+I ran the test on the all three systems, as well as an internal chimera with rdma.
 
 |                      | chimera       | chimera rdma         | bf1          | chimera bf1 rdma     |
-|----------------------|---------------|----------------------|--------------|----------------------|
+| -------------------- | ------------- | -------------------- | ------------ | -------------------- |
 | technology           | native fs     | rdma (same computer) | native fs    | rdma (bf1 - chimera) |
 | create files         | 2270277/8m45s | 2283047/10m8s        | 58123/2m33s  | 57420/4m49s          |
 | random access        | 564363/1m45s  | 564272/1m45s         | 10452/0m0.6s | 10459/0m8s           |
@@ -368,11 +369,8 @@ I draw 2 conclusions from this data.
    the host computer, copied into a memory mapped file, and a confirmation is
    sent back. This means that any read and write must occur twice.
 
-
-
-
 <!-- Workloads and environment used for evaluation -->
-<!-- Reproduction instructions --> 
+<!-- Reproduction instructions -->
 <!-- Performance results, as figures or tables -->
 <!-- Comparison to any other known results -->
 
@@ -387,6 +385,5 @@ RDMA communication exchanges a full buffer of size `READ_WRITE_BUFFER_SIZE`
 (8192). I would like to extend the system, to only exchange the necessary amount
 of space. There are also missing capabilities, like permissions and soft links.
 
-<!-- Summary of findings and experience working on this project --> 
+<!-- Summary of findings and experience working on this project -->
 <!-- Future work and “wish list” items -->
-

@@ -10,7 +10,7 @@ edition = "2018"
 # custom for some extra derives
 fuser = { version = "0.7", git = "https://github.com/iwahbe/fuser.git", branch = "from-metadata-for-fileattr", features = ["serializable", "abi-7-19"]}
 libc = "0.2"
-nix = "0.20"
+nix = "0.20.2"
 clap = "2.33"
 log = "0.4"
 env_logger = "0.8"
