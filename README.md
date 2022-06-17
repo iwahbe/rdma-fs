@@ -12,7 +12,7 @@ is provided as is and without warranty.
 ### Building
 
 The program should compile fine with `cargo build`. It does need rust's nightly
-compiler and fuser header files.
+compiler as well as FUSE and Linux header files.
 
 ### Background <!-- (1-2 pages) -->
 
